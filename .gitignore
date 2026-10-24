@@ -1,0 +1,29 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+# *.py[cod]
+# *$py.class
+
+# ==============================
+# Virtual environments
+# ==============================
+.venv/
+
+# ==============================
+# Environment variables and secrets
+# ==============================
+.env
+
+# *.csv
+# localhost-inventario-public.png
+
+# .ipynb_checkpoints/
+
+data/
+reports/
+.claude/
+results/
+LOG_DECISIONES.md

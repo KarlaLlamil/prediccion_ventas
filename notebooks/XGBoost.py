@@ -4,11 +4,11 @@ Se conserva la idea original: un XGBRegressor por serie (mismos hiperparámetros
 métricas wMAPE / sMAPE / MAE / RMSE / R² y pronóstico del siguiente periodo para el top de productos.
 Adaptaciones:
 - Datos: `data/processed/panel.parquet` en lugar de SQLite. El panel ya es `concepto = 'Venta Producto'` por mes de
-  `order_date` (no `fechafactura`), deduplicado y hasta sep-2026 (oct-2026 se eliminó, LOG #3).
-- Horizonte h = 4 (lead time 3 + revisión 1): los lags son 4, 5 y 6 (con h = 4 no se conoce t−1…t−3).
+   `fechafactura´, deduplicado y hasta sep-2026 (oct-2026 se eliminó, LOG #3).
+- Horizonte h = 3: los lags son 3, 4 y 5 (al pronosticar t desde el origen t−3 no se conocen t−1 ni t−2).
 - Top 30 (en lugar de 50) por unidades del último año, en dos niveles: SKU y familia.
 - Además del ajuste in-sample del original, se evalúa fuera de muestra con el mismo walk-forward que el resto de
-  los modelos (`backtest.py`: en cada origen T se entrena con datos ≤ T y se pronostica T + 4). Así se compara
+  los modelos (`backtest.py`: en cada origen T se entrena con datos ≤ T y se pronostica T + 3). Así se compara
   contra los nuestros en igualdad de condiciones. El in-sample se conserva solo como referencia: mide qué tan bien
   el modelo memoriza la historia, no qué tan bien pronostica.
 
@@ -31,7 +31,8 @@ from features import H, MESES, PROC
 
 warnings.filterwarnings('ignore')
 TOP = 30
-LAGS = [H, H + 1, H + 2]                       # lag_4, lag_5, lag_6
+LAGS = [H, H + 1, H + 2]                       # lag_3, lag_4, lag_5
+assert min(LAGS) >= H, f"lags menores que el horizonte H = {H} (leakage): {LAGS}"
 FEATURES = ['mes'] + [f'lag_{i}' for i in LAGS]
 
 
@@ -66,7 +67,7 @@ def preparar_datos_supervisados(df_producto, lags=LAGS):
     # Crear variables de fecha
     df_completo['mes'] = df_completo['ds'].dt.month
 
-    # Crear lags (t-4, t-5, t-6): con h = 4 son los más recientes conocidos al pronosticar
+    # Crear lags (t-3, t-4, t-5): con h = 3 son los más recientes conocidos al pronosticar
     for i in lags:
         df_completo[f'lag_{i}'] = df_completo['y'].shift(i)
 
@@ -81,7 +82,7 @@ def nuevo_modelo():
 
 # 4. Entrenamiento y evaluación
 def walk_forward(df_prep):
-    """En cada origen T: entrena con objetivos ≤ T y pronostica T + 4 (sus lags 4–6 son T, T−1, T−2)."""
+    """En cada origen T: entrena con objetivos ≤ T y pronostica T + 3 (sus lags 3–5 son T, T−1, T−2)."""
     filas = []
     for periodo, origenes in ORIGENES.items():
         for o in origenes:
@@ -111,7 +112,7 @@ def correr(nivel):
             nivel: producto, 'R2': r2_score(y, y_pred), 'wMAPE': wmape(y, y_pred), 'sMAPE': smape(y, y_pred),
             'MAE': mean_absolute_error(y, y_pred), 'RMSE': np.sqrt(mean_squared_error(y, y_pred))})
 
-        # 5. Predecir t + 4 (ene-2027) desde el último mes con datos (sep-2026)
+        # 5. Predecir t + 3 (dic-2026) desde el último mes con datos (sep-2026)
         ultimo = df_prep['ds'].max()
         siguiente_mes = ultimo + pd.DateOffset(months=H)
         serie_y = df_prep.set_index('ds').y

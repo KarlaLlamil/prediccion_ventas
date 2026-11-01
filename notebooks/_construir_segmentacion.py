@@ -15,7 +15,7 @@ py = lambda s: CELDAS.append(nbf.v4.new_code_cell(s.strip()))
 md("""
 # 04 · Segmentación dinámica: ABC móvil, fase de ciclo de vida y servicio diferenciado
 
-Continuación de `03_inventario.ipynb`. Ahí el servicio diferenciado por ABC (A 95 / B 90 / C 80) costó 3–19 % más
+Continuación de `03_inventario.ipynb`. Ahí el servicio diferenciado por ABC (A 95 / B 90 / C 80) costó 7–18 % más
 stock que un nivel uniforme con el mismo fill rate. Pero ese ABC era **estático**: se calculó una sola vez con los
 12 meses a ago-2025 y no reconocía a los SKUs nuevos (`sin_ABC`). Aquí se repite la prueba con una segmentación que
 se recalcula **en cada origen**, solo con datos ≤ origen. Código en `src/segmentacion.py`; decisiones en
@@ -25,11 +25,12 @@ LOG_DECISIONES #31.
 |---|---|
 | **ABC móvil** | Valor = Σ unidades × precio MXN del mes, ventana de 12 meses. A/B/C hasta 80/95/100 % del valor acumulado. Sin venta en 12 meses → C |
 | Anualización (< 12 meses de vida) | Edad 1–11: (valor 12 m − valor del mes 0) × 12 / edad, **sin el mes de lanzamiento** (llenado de canal). Edad 0: valor del mes 0 × 12 / factor de lanzamiento |
-| **Fase de ciclo de vida** | `introducción`: edad < 12 meses. `inactivo`: sin venta en los últimos 6 meses. Si no, r = media de los últimos 6 meses ÷ media de los mismos 6 meses del año anterior (quita la estacionalidad, sin el mes 0): `crecimiento` r ≥ 1.3 · `madurez` · `declive` r ≤ 1/1.3 |
+| **Fase de ciclo de vida** | `introducción`: edad < 12 meses. `dormido`: sin venta en los últimos 12 meses (repuesto que se conserva y puede volver a venderse). Sin venta en 6 meses pero sí en 12 → `declive`. Si no, r = media de los últimos 6 meses ÷ media de los mismos 6 meses del año anterior (quita la estacionalidad, sin el mes 0): `crecimiento` r ≥ 1.3 · `madurez` · `declive` r ≤ 1/1.3 |
 | Nivel de servicio por SKU-mes | El SS empírico de cada decisión T usa el nivel α de la etiqueta en T. Los ajustes por fase mueven α por la escalera 0 (sin SS) · 70 · 80 · 90 · 95 · 98 % |
 
-Las métricas son las mismas de `03_inventario` (ML_base + SS empírico, venta perdida). Las comparaciones se hacen
-**a igual fill rate** contra la curva uniforme.
+Las métricas son las mismas de `03_inventario` (SS empírico, venta perdida), calculadas con `ML_base` para los
+maduros. La política elegida usa `TD_estado` (LOG #45), pero en inventario los dos empatan (±1–7 %) y aquí todas las
+comparaciones son relativas, **a igual fill rate** contra la curva uniforme del mismo modelo.
 """)
 
 py("""
@@ -126,9 +127,9 @@ fig.suptitle("Sombreado = COVID 2020–2022", fontsize=9, color=GRIS)
 fig.savefig(FIG / "23_segmentacion_movil.png"); plt.show()
 """)
 
-md("### 2.2 Estabilidad de la fase (SKUs no inactivos)")
+md("### 2.2 Estabilidad de la fase (SKUs no dormidos)")
 py("""
-x = s[(s.mes >= "2024-09-01") & s.fase_prev.notna() & (s.fase != "inactivo") & (s.fase_prev != "inactivo")]
+x = s[(s.mes >= "2024-09-01") & s.fase_prev.notna() & (s.fase != "dormido") & (s.fase_prev != "dormido")]
 print(f"SKU-mes que cambian de fase: {(x.fase != x.fase_prev).mean():.1%}")
 print(pd.crosstab(x.fase_prev, x.fase, normalize="index").round(2).to_string())
 """)
@@ -136,7 +137,7 @@ print(pd.crosstab(x.fase_prev, x.fase, normalize="index").round(2).to_string())
 md("""
 ### 2.3 ¿El pronóstico se equivoca distinto por fase?
 
-Error de `ML_base` (SKUs maduros) y de `Media_post` (jóvenes) a h = 4, con la fase en el **origen** del pronóstico.
+Error de `ML_base` (SKUs maduros) y de `Media_post` (jóvenes) a h = 3, con la fase en el **origen** del pronóstico.
 Sesgo = Σ(pronóstico − real) / Σ real.
 """)
 py("""
@@ -221,36 +222,38 @@ md("""
 1. **El ABC móvil es estable y corrige dos fallas del estático.** Solo el 1.5 % de los SKU-mes cambia de clase de un
    mes al siguiente. En ago-2025 coincide con el estático en los SKUs maduros (8 B → A y 13 C → B por la
    anualización), pero además clasifica a los 1,469 SKUs `sin_ABC`. El estático tenía **leakage en validación**:
-   se calculó con datos hasta ago-2025, que es el final de ese periodo. Por eso su +3 % en validación era optimista;
-   el ABC móvil, que es causal, da +10 %.
+   se calculó con datos hasta ago-2025, después del final de la validación (jun-2025). Por eso su +6 % en validación
+   era optimista; el ABC móvil, que es causal, da +19 %.
 2. **Anualizar sí importa para los jóvenes.** Sin anualizar, la mayoría de los SKU-mes jóvenes cae en C. Anualizados,
    unos 250 pasan de C a B y unos 95 de B a A. El factor de lanzamiento medido como razón de sumas es **1.15**, no
    4×. El "4×" del análisis de cold start describía al SKU típico; en los SKUs grandes, que dominan el valor, el mes
    de lanzamiento pesa poco más que un mes normal.
-3. **Aun con el ABC móvil, el servicio 95/90/80 no conviene:** cuesta **+10 % (validación) y +19 % (prueba)** más
+3. **Aun con el ABC móvil, el servicio 95/90/80 no conviene:** cuesta **+19 % (validación) y +22 % (prueba)** más
    stock que el nivel uniforme con el mismo fill rate. La razón es la misma de antes. Con el nivel uniforme al 90 %,
-   los SKUs A ya logran ~94 % de fill con 3.4 meses de cobertura, y subirlos a 95 % es lo más caro: ~27 M MXN por
+   los SKUs A ya logran ~94 % de fill con 3.0 meses de cobertura, y subirlos a 95 % es lo más caro: ~21 M MXN por
    2 puntos. Bajar C a 80 % ahorra muy poco (~1 M MXN), porque su stock es de cola larga, no de SS.
-4. **La fase de ciclo de vida, tal como está definida, es ruidosa:** el 21 % de los SKU-mes activos cambia de fase de
+4. **La fase de ciclo de vida, tal como está definida, es ruidosa:** el 20 % de los SKU-mes activos cambia de fase de
    un mes al siguiente (madurez solo se mantiene el 66 %). La figura 23 muestra además que las fases se mueven en
-   **olas de todo el mercado** (crecimiento en 2021 por el COVID, declive en 2019 y 2024–25 por los destocks): la
+   **olas de todo el mercado** (crecimiento en 2021 por el COVID, declive en caida_2019 y caida_2024): la
    tendencia de 6 meses mide más el ciclo agregado que el ciclo de vida de cada SKU. Eso es caro en una política order-up-to porque **el
    inventario sube rápido y baja lento**: cuando el nivel α sube, el pedido es inmediato, y cuando baja, el exceso
-   solo se drena con la venta. Por eso combinar fases con ABC (`ABC móvil + fase`) cuesta **+35 % / +62 %**, y el
-   paquete completo de fases sobre el uniforme 90 % cuesta +9 % / +20 %.
+   solo se drena con la venta. Por eso combinar fases con ABC (`ABC móvil + fase`) cuesta **+40 % / +52 %**, y el
+   paquete completo de fases sobre el uniforme 90 % cuesta +7 % / +13 % (validación / prueba).
 5. **Descomposición de los ajustes por fase (sobre el uniforme 90 %):**
-   - **Introducción −1 (90 → 80 % en SKUs con < 12 meses): ahorra 4 % (validación) y 6 % (prueba)** a igual fill, y
-     baja el stock en riesgo de 2.95 a 2.57 M MXN. Es el único ajuste que mejora en los dos periodos. Ataca el
-     sobre-stock de los nuevos que vimos en `03_inventario` (20–30 meses de cobertura): el SS de la clase "joven"
+   - **Introducción −1 (90 → 80 % en SKUs con < 12 meses): ahorra 10 % en validación y 10 % en prueba** a igual
+     fill, y baja el stock en riesgo de 2.59 a 2.13 M MXN. Es el único ajuste que mejora en los dos periodos. Ataca
+     el sobre-stock de los nuevos que vimos en `03_inventario` (~20 meses de cobertura): el SS de la clase "joven"
      compensaba de más el sesgo de `Media_post`.
-     **El costo está en el servicio a los nuevos:** su fill rate baja de 85 % a 71 % (son ~2 % de las unidades), y su
-     cobertura, de 10.2 a 6.1 meses. Si comercialmente importa no quebrar en lanzamientos, el ajuste no conviene.
-   - Crecimiento +1: +3 % / +9 %. Declive −1: +6 % / +11 %. La tabla 2.3 explica por qué: la tendencia de 6 meses
-     **revierte a la media**. El ML ya **sobre**-pronostica a los SKUs "en crecimiento" (sesgo +8 % en prueba, +31 %
-     en validación) y no sub-pronostica a los "en declive" (−10 % / +1 %). Subir el SS al que crece o bajarlo al que
-     cae persigue un ruido que el pronóstico ya absorbió.
-   - Inactivo sin SS: sin efecto. Su pronóstico ya es ~0 y su stock es remanente, no SS.
-6. **ABC inverso (A 90 / B 95 / C 90):** −2 % en validación y +4 % en prueba. No es robusto, así que no se adopta.
+     **El costo está en el servicio a los nuevos:** su fill rate baja de 90 % a 76 % (son ~2 % de las unidades), y su
+     cobertura, de 8.5 a 4.7 meses. Si comercialmente importa no quebrar en lanzamientos, el ajuste no conviene.
+   - Crecimiento +1: +3 % / +6 %. Declive −1: +11 % / +10 %. La tabla 2.3 explica por qué: la tendencia de 6 meses
+     **revierte a la media**. El pronóstico ya **sobre**-pronostica a los SKUs "en crecimiento" (sesgo +6 % en
+     prueba, +32 % en validación) y en "declive" el sesgo no es consistente (−13 % / +9 %). Subir el SS al que crece o
+     bajarlo al que cae persigue un ruido que el pronóstico ya absorbió. Es el mismo fenómeno, a nivel SKU, que
+     justifica `TD_estado` a nivel familia (`02_modelos` §3.8): las alzas suelen revertir.
+   - Dormido sin SS: sin efecto. Los dormidos (12 meses sin venta) ya no tienen pronóstico; su stock es remanente de
+     repuesto, no SS.
+6. **ABC inverso (A 90 / B 95 / C 90):** −5 % en validación y +1 % en prueba. No es robusto, así que no se adopta.
    B era el segmento donde un punto de servicio cuesta menos stock, pero la ventaja no se sostiene.
 7. **Recomendación:** mantener el **nivel uniforme** (90 % según el margen de equilibrio de `03_inventario` §3.2) y
    adoptar solo el ajuste **introducción −1** (SKUs con < 12 meses de vida → un escalón abajo). El ABC móvil y la

@@ -3,12 +3,13 @@
 Edad a = mes − mes de lanzamiento (a = 0 es el mes de lanzamiento, que es llenado de canal ≈ 4× el nivel posterior).
 Dos segmentos fuera del set maduro (≥ 13 meses de vida) del backtest principal:
 
-    joven       0 ≤ a ≤ 11 en el origen T (al menos el mes de lanzamiento observado); objetivo en a + 4 ∈ [4, 15].
+    joven       0 ≤ a ≤ 11 en el origen T (al menos el mes de lanzamiento observado); objetivo en a + H ∈ [3, 14].
                 Modelo global propio (HistGradientBoosting Poisson sobre y/escala) contra baselines simples.
-    prelanz     lanzamiento en T+1 … T+4: sin venta propia en el origen; objetivo en a ∈ [0, 3].
+    prelanz     lanzamiento en T+1 … T+H: sin venta propia en el origen; objetivo en a ∈ [0, H − 1] = [0, 2].
                 Regla de análogos con rango p25–p75 / p10–p90 (supone que el lanzamiento se conoce por comercial).
 
-Análogos (causales): SKUs lanzados desde 2016 (los de 2015 están censurados por la izquierda) cuya curva de 16 meses
+(H = 3.) Análogos (causales): SKUs lanzados desde 2016 (los de 2015 están censurados por la izquierda) cuya curva de
+A_MAX = 12 + H = 15 meses
 ya terminó en el origen. Jerarquía familia+sublínea+banda de precio → familia+sublínea → familia → global, con ≥ 5
 análogos por nivel. Atributos del catálogo: solo códigos (sublínea) y PrecioLista; nunca descripciones (LOG #2).
 
@@ -26,12 +27,12 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 import features as ft
-from features import H, MESES, RAIZ, _por_familia, _rolling, indice_estacional
-from backtest import ORIGENES, SALIDA, SHOCK_COVID, _matriz
+from features import H, MESES, RAIZ, _por_familia, indice_estacional
+from backtest import ORIGENES, PUENTE, SALIDA, _matriz, entrenamiento
 
 warnings.filterwarnings("ignore")
 EDAD_MAX = 12                          # meses de vida en el origen (a = 0…11)
-A_MAX = EDAD_MAX + H                   # largo de la curva de análogos (a = 0…15)
+A_MAX = EDAD_MAX + H                   # largo de la curva de análogos (a = 0…14 con H = 3)
 NAC_MIN = 12                           # análogos lanzados desde ene-2016
 MIN_ANALOGOS = 5
 K = 3                                  # peso (en meses) del prior en la escala
@@ -134,11 +135,8 @@ def construir(datos, L, A, origenes):
     NZ = np.cumsum(y0 > 0, axis=1)
     idx = np.where(y0 > 0, np.arange(len(MESES))[None, :], -1)
     ultima = np.maximum.accumulate(idx, axis=1)
-    fams, fc = _por_familia(datos, datos.c)
+    fams = _por_familia(datos, datos.y[:, :1])[0]
     pos_fam = pd.Index(fams).get_indexer(datos.familia)
-    fam_ma3, fam_ma12 = _rolling(fc, 3, "mean"), _rolling(fc, 12, "mean")
-    fc_df = pd.DataFrame(fc.T, index=MESES, columns=fams)
-    tot_df = pd.DataFrame(fc.sum(axis=0)[:, None], index=MESES, columns=["total"])
     i_nac, n_mes = datos.i_nac, len(MESES)
 
     jov, pre = [], []
@@ -146,7 +144,12 @@ def construir(datos, L, A, origenes):
         obj = o + H
         mes_obj = MESES[o] + pd.DateOffset(months=H)
         y_obj = lambda k: y0[k, obj] if obj < n_mes else np.full(len(k), np.nan)
-        base = {"origen": MESES[o], "mes_obj": mes_obj}
+        base = {"origen": MESES[o], "mes_obj": mes_obj, "obj_bajo": bool(datos.bajo[obj]) if obj < n_mes else False}
+        # agregados de familia con la serie de modelado vista desde el origen (como features.construir)
+        _, fc = _por_familia(datos, datos.serie(o)[:, :o + 1])
+        fam_ma3, fam_ma12 = fc[:, -3:].mean(axis=1), fc[:, -12:].mean(axis=1)
+        fc_df = pd.DataFrame(fc.T, index=MESES[:o + 1], columns=fams)
+        tot_df = fc_df.sum(axis=1).to_frame("total")
 
         k = np.flatnonzero((o - i_nac >= 0) & (o - i_nac < EDAD_MAX))
         if len(k):
@@ -162,8 +165,8 @@ def construir(datos, L, A, origenes):
             prior_nivel = np.nan_to_num(an["nivel"], nan=0.0)
             escala = np.maximum((n_post * np.nan_to_num(media_post) + K * prior_nivel) / (n_post + K), .05)
             f = pos_fam[k]
-            ie_f = indice_estacional(fc_df.iloc[:o + 1])
-            ie_tot = indice_estacional(tot_df.iloc[:o + 1])["total"].get(mes_obj.month, np.nan)
+            ie_f = indice_estacional(fc_df)
+            ie_tot = indice_estacional(tot_df)["total"].get(mes_obj.month, np.nan)
             ie_fam = ie_f.loc[mes_obj.month].to_numpy()[f] if mes_obj.month in ie_f.index else np.full(len(k), np.nan)
             r = {"id_articulo": datos.skus[k], "familia": datos.familia[k], "perfil": datos.perfil[k], **base,
                  "y": y_obj(k), "escala": escala, "edad": a_o + 1, "n_post": n_post,
@@ -176,7 +179,7 @@ def construir(datos, L, A, origenes):
                  "prior_superv": an["superv"], "prior_rampa": an["rampa"], "log_n_analogos": np.log(an["n"]), "nivel_analogo": an["nivel_analogo"],
                  "log_precio": L.log_precio.to_numpy()[k],
                  "ie_fam": np.where(np.isnan(ie_fam), ie_tot, ie_fam), "ie_total": ie_tot,
-                 "fam_momentum": fam_ma3[f, o] / np.maximum(fam_ma12[f, o], 1e-3), "mes_obj_n": mes_obj.month,
+                 "fam_momentum": fam_ma3[f] / np.maximum(fam_ma12[f], 1e-3), "mes_obj_n": mes_obj.month,
                  # baselines
                  "Media_post": np.where(n_post > 0, media_post, prior_nivel), "Escala": escala,
                  "Analogos": escala * np.nan_to_num(an["rel"], nan=1.0),
@@ -195,9 +198,10 @@ def construir(datos, L, A, origenes):
 
 
 def ml(tabla, o):
-    """Igual que backtest.ml: entrena con objetivos conocidos en o (sin el choque COVID) y pronostica el origen o."""
+    """Igual que backtest.ml: entrena con objetivos conocidos en o (sin meses bajos del total) y pronostica el origen o.
+    El objetivo es crudo: un SKU joven todavía no tiene clase SB estable para decidir si se limpia."""
     T = MESES[o]
-    tr = tabla[(tabla.mes_obj <= T) & ~tabla.mes_obj.between(*SHOCK_COVID)]
+    tr = entrenamiento(tabla, T)
     te = tabla[tabla.origen == T]
     cats = sorted(tr.familia.unique())
     m = HistGradientBoostingRegressor(loss="poisson", categorical_features="from_dtype", random_state=0, **HIPER)
@@ -235,7 +239,7 @@ def main():
     print(f"jóvenes {jov.shape}, pre-lanzamiento {pre.shape}  ({time.time() - t0:.0f}s)", flush=True)
 
     meta = {}
-    for periodo, origenes in ORIGENES.items():
+    for periodo, origenes in {**ORIGENES, "puente": PUENTE}.items():     # puente: solo continuidad para inventario
         d = jov[jov.origen.isin(MESES[list(origenes)])].copy()
         d["ML_joven"] = pd.concat([ml(jov, o) for o in origenes])
         d.to_parquet(SALIDA / f"cold_jovenes_{periodo}.parquet", index=False)

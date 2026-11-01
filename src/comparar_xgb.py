@@ -1,8 +1,8 @@
-"""Comparación del XGBoost por serie (`notebooks/XGBoost.py`, LOG #33) contra nuestros modelos, mismo walk-forward h = 4.
+"""Comparación del XGBoost por serie (`notebooks/XGBoost.py`, LOG #33) contra nuestros modelos, mismo walk-forward h = 3.
 
 - SKU: los top 30 SKUs, solo los pares (SKU, origen) que están en el set evaluado del backtest.
 - Familia: las top 30 familias. Real = total de la familia (todos sus SKUs). Lo nuestro se agrega por familia como lo
-  usa la política de pedidos: maduros (`ML_base` o `TD_mix_k3`) + jóvenes (`Media_post`). Los SKUs pre-lanzamiento
+  usa la política de pedidos: maduros (`ML_base` o el modelo elegido, `TD_estado`, LOG #45) + jóvenes (`Media_post`). Los SKUs pre-lanzamiento
   (~0.4 % de las unidades) no tienen pronóstico, igual que en producción. SNaive = el mismo mes del año anterior.
 MASE con la escala de cada serie (MAE in-sample del seasonal-naive hasta el origen), como en `metricas.py`.
 """
@@ -12,15 +12,19 @@ import pandas as pd
 import features as ft
 from backtest import SALIDA
 from features import MESES
+from jerarquico import modelo_elegido
 from metricas import escalas, resumen
 
-NUESTROS = ["ML_base", "TD_mix_k3", "Ruta_clasica", "MA12", "SNaive"]
+TD = modelo_elegido()
+NUESTROS = ["ML_base", TD, "Ruta_clasica", "MA12", "SNaive"]
 
 
 def _pronosticos(p):
     d = pd.read_parquet(SALIDA / f"pronosticos_{p}.parquet")
-    jer = pd.read_parquet(SALIDA / f"pronosticos_{p}_jer.parquet")[["id_articulo", "origen", "TD_mix_k3"]]
-    return d.merge(jer, on=["id_articulo", "origen"])
+    jer = pd.read_parquet(SALIDA / f"pronosticos_{p}_jer.parquet")
+    if TD not in jer:                                    # modelo adoptado con LightGBM (LOG #50, `td_lgbm.py`)
+        jer = pd.read_parquet(SALIDA / f"td_lgbm_{p}.parquet")
+    return d.merge(jer[["id_articulo", "origen", TD]], on=["id_articulo", "origen"])
 
 
 def extras(d, m):
@@ -75,11 +79,11 @@ def nivel_familia():
         d = _pronosticos(p)
         jov = pd.read_parquet(SALIDA / f"cold_jovenes_{p}.parquet")[["id_articulo", "origen", "Media_post"]]
         jov["familia"] = pd.Series(datos.familia, index=datos.skus).reindex(jov.id_articulo).to_numpy()
-        mad = d.groupby(["familia", "origen"])[["ML_base", "TD_mix_k3", "Ruta_clasica", "MA12"]].sum()
+        mad = d.groupby(["familia", "origen"])[["ML_base", TD, "Ruta_clasica", "MA12"]].sum()
         joven = jov.groupby(["familia", "origen"]).Media_post.sum()
         f = xg[xg.periodo == p].set_index(["familia", "origen"])[["mes_obj", "XGBoost"]]
         f = f.join(mad).join(joven).fillna({"Media_post": 0})
-        for m in ["ML_base", "TD_mix_k3", "Ruta_clasica", "MA12"]:
+        for m in ["ML_base", TD, "Ruta_clasica", "MA12"]:
             f[m] = f[m].fillna(0) + f.Media_post
         f = f.reset_index()
         i = pos.get_indexer(f.familia)

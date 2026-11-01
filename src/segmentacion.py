@@ -9,11 +9,13 @@ ABC móvil: en cada mes t, solo con datos ≤ t.
 
 Fase de ciclo de vida en t:
     introducción   edad < 12 meses
-    inactivo       edad ≥ 12 y sin venta en los últimos 6 meses
+    dormido        edad ≥ 12 y sin venta en los últimos 12 meses (N_DORMIDO de preparar.py): repuesto que se conserva
+                   y puede volver a venderse; sin SS (el stock que tenga es remanente de repuesto, no protección)
     crecimiento / madurez / declive: r = media de los últimos 6 meses ÷ media base, donde la base son los mismos
                    6 meses del año anterior (quita la estacionalidad), sin el mes de lanzamiento. Si no hay base
                    (SKU de 12 meses), se usan los meses posteriores al lanzamiento previos a los últimos 6.
-                   r ≥ 1.3 → crecimiento, r ≤ 1/1.3 → declive, en medio → madurez.
+                   r ≥ 1.3 → crecimiento, r ≤ 1/1.3 → declive, en medio → madurez. Sin venta en 6 meses (pero sí
+                   en 12) → declive.
 
 Servicio diferenciado: se construye una matriz SKU × mes de niveles α que `inventario.stock_seguridad` lee en cada
 decisión (el nivel de T solo usa datos ≤ T). Los ajustes por fase mueven el nivel por la ESCALERA de niveles.
@@ -30,13 +32,14 @@ import features as ft
 import inventario as iv
 from backtest import SALIDA
 from features import MESES, PROC
+from preparar import N_DORMIDO
 
 FIN_FACTOR = MESES.get_loc(pd.Timestamp("2024-08-01"))   # último mes de datos para calibrar FACTOR_LANZ (antes de M0)
 UMBRAL_TEND = 1.3
-FASES = ["introducción", "crecimiento", "madurez", "declive", "inactivo"]
+FASES = ["introducción", "crecimiento", "madurez", "declive", "dormido"]
 ESCALERA = [0.0, .70, .80, .90, .95, .98]                # niveles posibles; 0 = sin SS
 ABC_959080 = {"A": .95, "B": .90, "C": .80}
-AJUSTE_FASE = {"introducción": -1, "crecimiento": +1, "madurez": 0, "declive": -1, "inactivo": None}  # None → sin SS
+AJUSTE_FASE = {"introducción": -1, "crecimiento": +1, "madurez": 0, "declive": -1, "dormido": None}  # None → sin SS
 UNIFORMES = [.70, .80, .90, .95, .98]
 
 
@@ -105,7 +108,7 @@ def fase_ciclo(datos):
     edad, _ = edad_meses(datos)
     post = (edad >= 1).astype(float)                       # meses posteriores al lanzamiento
     yp = y * post
-    s6 = _suma_movil(y, 6)
+    s6, s12 = _suma_movil(y, 6), _suma_movil(y, N_DORMIDO)
     sb, cb = _rezago(_suma_movil(yp, 6), 12), _rezago(_suma_movil(post, 6), 12)     # mismos 6 meses, año anterior
     sa, ca = _rezago(np.cumsum(yp, axis=1), 6), _rezago(np.cumsum(post, axis=1), 6)  # alternativa: post-lanzamiento
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -115,8 +118,8 @@ def fase_ciclo(datos):
     madura = edad >= 12
     fase[madura & (r >= UMBRAL_TEND)] = "crecimiento"
     fase[madura & (r < UMBRAL_TEND) & (r > 1 / UMBRAL_TEND)] = "madurez"
-    fase[madura & (r <= 1 / UMBRAL_TEND)] = "declive"
-    fase[madura & (s6 == 0)] = "inactivo"
+    fase[madura & ((r <= 1 / UMBRAL_TEND) | (s6 == 0))] = "declive"
+    fase[madura & (s12 == 0)] = "dormido"
     fase[(edad >= 0) & (edad < 12)] = "introducción"
     return fase, np.where(madura & (s6 > 0), r, np.nan)
 

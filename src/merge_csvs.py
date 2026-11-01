@@ -69,6 +69,11 @@ def convertir_fechas(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = pd.to_datetime(df[c].str[:23].str.replace("T", " "), format="ISO8601")
     for c in FECHAS:
         df[c] = df[c].dt.normalize()
+    # fechafactura es el eje temporal: si falta, se usa order_date (si no, el filtro del traslape tiraría la fila)
+    falta = df.fechafactura.isna()
+    if falta.any():
+        print(f"  {falta.sum():,} filas sin fechafactura → se usa order_date")
+        df["fechafactura"] = df.fechafactura.fillna(df.order_date)
     return df
 
 ref_cols = list(normalize_columns(read_csv_safe(big, nrows=0)).columns)

@@ -1,12 +1,17 @@
-"""Backtest walk-forward con h = 4 (fase 3; DECISIONES.md §13, LOG_DECISIONES #19).
+"""Backtest walk-forward con h = 3 (fase 3; DECISIONES.md §13, LOG_DECISIONES #19).
 
-Periodos (meses objetivo; origen = objetivo − 4):
-    validación  sep-2024 → ago-2025  (orígenes may-2024 → abr-2025): hiperparámetros, ablaciones, ruta por segmento.
-    prueba      sep-2025 → sep-2026  (orígenes may-2025 → may-2026): solo se evalúa lo ya elegido.
+Periodos (meses objetivo; origen = objetivo − 3):
+    validación  jul-2024 → jun-2025  (orígenes abril-2024 → marzo-2025): hiperparámetros, ablaciones, ruta por segmento.
+                El último objetivo de validación es el primer origen de prueba: ninguna decisión usa datos posteriores.
+    puente      jul-2025 → ago-2025  (orígenes abril–mayo-2025): solo se pronostican, para que inventario tenga meses
+                seguidos; no se usan para elegir ni para medir.
+    prueba      sep-2025 → sep-2026  (orígenes junio-2025 → junio-2026): solo se evalúa lo ya elegido.
 En cada origen T todo se ajusta con datos ≤ T (ventana expansiva, reentrenamiento mensual).
+Decisión con WAPE + sesgo (regla `metricas.adopta`); MASE y RMSSE se reportan como secundarias.
 
 Set evaluado en cada origen: SKUs vivos (venta en los últimos 12 meses) con ≥ 13 meses de historia. Los SKUs más
-jóvenes (cold start) quedan fuera y se reporta su peso.
+jóvenes (cold start) y los dormidos (≥ 12 meses sin venta: repuestos que pueden volver) quedan fuera y se reporta el
+peso de cada grupo en el mes objetivo.
 
 Modelos:
     Naive, SNaive (s = 12), MA12                         directos de la matriz
@@ -27,15 +32,18 @@ from statsforecast import StatsForecast
 from statsforecast.models import AutoARIMA, AutoETS, CrostonClassic, CrostonSBA, TSB
 
 import features as ft
-from features import BASE, DEVOL, H, MESES, SIN_LIMPIEZA, SOBRE_AGR, SOBRE_SKU
-from metricas import clase_sb, escalas, resumen
+from features import BASE, DEVOL, H, MESES, SIN_LIMPIEZA
+from metricas import clase_sb, elegir, escalas, resumen
 
 warnings.filterwarnings("ignore")
 SALIDA = ft.PROC / "resultados"
 I = MESES.get_loc
-ORIGENES = {"validacion": range(I(pd.Timestamp("2024-05-01")), I(pd.Timestamp("2025-04-01")) + 1),
-            "prueba": range(I(pd.Timestamp("2025-05-01")), I(pd.Timestamp("2026-05-01")) + 1)}
-SHOCK_COVID = (pd.Timestamp("2020-03-01"), pd.Timestamp("2020-06-01"))   # objetivos excluidos del entrenamiento ML
+ORIGENES = {"validacion": range(I(pd.Timestamp("2024-04-01")), I(pd.Timestamp("2025-03-01")) + 1),
+            "prueba": range(I(pd.Timestamp("2025-06-01")), I(pd.Timestamp("2026-06-01")) + 1)}
+PUENTE = range(ORIGENES["validacion"][-1] + 1, ORIGENES["prueba"][0])
+assert ORIGENES["validacion"][-1] + H <= ORIGENES["prueba"][0], \
+    "un objetivo de validación cae después del primer origen de prueba (fuga en la selección)"
+assert ORIGENES["prueba"][-1] + H == len(MESES) - 1, "el último objetivo de prueba debe ser el último mes con datos"
 MIN_MESES_FAM = 36
 
 HIPER = {"A": dict(learning_rate=.05, max_iter=300, max_leaf_nodes=31, min_samples_leaf=50),
@@ -43,9 +51,6 @@ HIPER = {"A": dict(learning_rate=.05, max_iter=300, max_leaf_nodes=31, min_sampl
          "C": dict(learning_rate=.03, max_iter=600, max_leaf_nodes=63, min_samples_leaf=30, l2_regularization=1.0)}
 VARIANTES = {"ML_base": BASE,
              "ML_sin_limpieza": [SIN_LIMPIEZA.get(f, f) for f in BASE],
-             "ML_sobre_sku": BASE + SOBRE_SKU,
-             "ML_sobre_agr": BASE + SOBRE_AGR,
-             "ML_sobre_todo": BASE + SOBRE_SKU + SOBRE_AGR,
              "ML_devol": BASE + DEVOL}
 CANDIDATOS_RUTA = ["SNaive", "MA12", "ETS", "SARIMA_fam", "Croston", "SBA", "TSB"]
 
@@ -99,14 +104,19 @@ def _matriz(tab, cols, categorias):
     return x
 
 
+def entrenamiento(tabla, T):
+    """Filas con objetivo conocido en T (mes_obj ≤ T), sin los meses bajos del total como objetivo."""
+    return tabla[(tabla.mes_obj <= T) & ~tabla.obj_bajo]
+
+
 def ml(tabla, cols, o, hiper):
-    """Ajusta con objetivos conocidos en o (mes_obj ≤ T, sin el choque COVID) y pronostica las filas del origen o."""
+    """Ajusta con objetivos conocidos en o (objetivo limpio `y_entreno`) y pronostica las filas del origen o."""
     T = MESES[o]
-    tr = tabla[(tabla.mes_obj <= T) & ~tabla.mes_obj.between(*SHOCK_COVID)]
+    tr = entrenamiento(tabla, T)
     te = tabla[tabla.origen == T]
     cats = sorted(tr.familia.unique())
     m = HistGradientBoostingRegressor(loss="poisson", categorical_features="from_dtype", random_state=0, **hiper)
-    m.fit(_matriz(tr, cols, cats), tr.y / tr.escala)
+    m.fit(_matriz(tr, cols, cats), tr.y_entreno / tr.escala)
     return pd.Series(m.predict(_matriz(te, cols, cats)) * te.escala.to_numpy(), index=te.id_articulo.to_numpy())
 
 
@@ -125,11 +135,16 @@ def base_origen(datos, tabla, o):
 
 
 def cobertura(datos, o):
-    """Peso en el mes objetivo de los SKUs que no entran al set (jóvenes o nacidos después del origen)."""
+    """Peso en el mes objetivo de los SKUs fuera del set: jóvenes (incluye nacidos después del origen) y dormidos
+    (≥ 13 meses de historia pero sin venta en los últimos 12: su venta en el objetivo es una reactivación)."""
     obj = o + H
-    vivo = (datos.i_nac <= o - (ft.MIN_HISTORIA - 1)) & (np.nansum(datos.y[:, o - 11:o + 1], axis=1) > 0)
+    maduro = datos.i_nac <= o - (ft.MIN_HISTORIA - 1)
+    vendio = np.nansum(datos.y[:, o - 11:o + 1], axis=1) > 0
     tot = np.nansum(datos.y[:, obj])
-    return {"mes_obj": MESES[obj], "u_total": tot, "u_fuera_set": np.nansum(datos.y[~vivo, obj])}
+    u = lambda m: np.nansum(datos.y[m, obj])
+    return {"mes_obj": MESES[obj], "u_total": tot, "u_fuera_set": u(~(maduro & vendio)), "u_jovenes": u(~maduro),
+            "u_dormidos": u(maduro & ~vendio), "skus_dormidos": int((maduro & ~vendio).sum()),
+            "skus_dormidos_reactivados": int((maduro & ~vendio & (np.nan_to_num(datos.y[:, obj]) > 0)).sum())}
 
 
 def main():
@@ -140,8 +155,9 @@ def main():
     tabla.to_parquet(ft.PROC / "features.parquet", index=False)
     print(f"features: {tabla.shape}  ({time.time() - t0:.0f}s)", flush=True)
 
+    periodos = {**ORIGENES, "puente": PUENTE}
     res = {}
-    for periodo, origenes in ORIGENES.items():
+    for periodo, origenes in periodos.items():
         partes = []
         for o in origenes:
             t = time.time()
@@ -149,34 +165,38 @@ def main():
             print(f"  {periodo} {MESES[o]:%Y-%m}: estadísticos ({time.time() - t:.0f}s)", flush=True)
         res[periodo] = pd.concat(partes, ignore_index=True)
 
-    # 1) hiperparámetros del modelo global: solo validación, features base
+    # 1) hiperparámetros del modelo global: solo validación, features base; regla WAPE + sesgo frente a A
     val = res["validacion"]
     hiper_res = {}
     for nombre, h in HIPER.items():
         p = pd.concat([ml(tabla, BASE, o, h) for o in ORIGENES["validacion"]])
         val[f"hp_{nombre}"] = p.to_numpy()
         hiper_res[nombre] = resumen(val, [f"hp_{nombre}"]).iloc[0].to_dict()
-        print(f"  hiper {nombre}: MASE {hiper_res[nombre]['MASE']:.3f}  ({time.time() - t0:.0f}s)", flush=True)
-    mejor = min(hiper_res, key=lambda n: hiper_res[n]["MASE"])
+        print(f"  hiper {nombre}: WAPE {hiper_res[nombre]['WAPE']:.3f}  sesgo {hiper_res[nombre]['sesgo']:+.3f}  "
+              f"({time.time() - t0:.0f}s)", flush=True)
+    mejor = elegir(val, [f"hp_{n}" for n in HIPER], "hp_A").removeprefix("hp_")
     val.drop(columns=[c for c in val.columns if c.startswith("hp_")], inplace=True)
 
-    # 2) variantes de features (ablaciones), con los hiperparámetros elegidos, en validación y prueba
-    for periodo, origenes in ORIGENES.items():
+    # 2) variantes de features (ablaciones), con los hiperparámetros elegidos, en todos los periodos
+    for periodo, origenes in periodos.items():
         for nombre, cols in VARIANTES.items():
             res[periodo][nombre] = pd.concat([ml(tabla, cols, o, HIPER[mejor]) for o in origenes]).to_numpy()
             print(f"  {periodo} {nombre} ({time.time() - t0:.0f}s)", flush=True)
 
-    # 3) ruta por segmento: el mejor modelo clásico de cada clase SB en validación (por MASE) se aplica en prueba
-    ruta = {c: resumen(g, CANDIDATOS_RUTA).MASE.idxmin() for c, g in val.groupby("clase")}
+    # 3) ruta por segmento: en cada clase SB, el clásico que cumple la regla WAPE + sesgo frente a SNaive (WAPE
+    #    dentro de la clase, en validación) se aplica en los demás periodos
+    ruta = {c: elegir(g, CANDIDATOS_RUTA, "SNaive") for c, g in val.groupby("clase")}
     for periodo in res:
         d = res[periodo]
         d["Ruta_clasica"] = [d.at[i, ruta.get(c, "SNaive")] for i, c in zip(d.index, d.clase)]
 
     for periodo, d in res.items():
         d.to_parquet(SALIDA / f"pronosticos_{periodo}.parquet", index=False)
-    cob = pd.DataFrame([cobertura(datos, o) for p in ORIGENES.values() for o in p])
+    cob = pd.DataFrame([cobertura(datos, o) for p in periodos.values() for o in p])
     cob.to_csv(SALIDA / "cobertura.csv", index=False)
-    meta = {"hiper": hiper_res, "hiper_elegido": mejor, "ruta": ruta, "segundos": round(time.time() - t0)}
+    meta = {"hiper": hiper_res, "hiper_elegido": mejor, "ruta": ruta,
+            "meses_bajos": {n: [f"{m:%Y-%m}" for m in ms] for n, ms in ft.nombres_bajos(datos.bajo).items()},
+            "segundos": round(time.time() - t0)}
     (SALIDA / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     print(json.dumps(meta, indent=2, ensure_ascii=False, default=str))
 

@@ -1,7 +1,8 @@
 """Preparación: de data/full_2015_2026.parquet (salida de merge_csvs.py) a las tablas limpias de data/processed/.
 
 Aplica DECISIONES.md §3–§10 y LOG_DECISIONES.md (2026-10-22):
-- deduplicado (§5), corte de oct-2026 (mes parcial), eje temporal = order_date (§6);
+- deduplicado (§5), corte de oct-2026 (mes parcial), eje temporal = fechafactura (§6); si una línea no trae
+  fechafactura se usa su order_date;
 - se eliminan descripciones, nombres de cliente y región (§4); se conservan claves (id_articulo, familia, cliente);
 - target = concepto 'Venta Producto' con cantidad > 0 (§3); devoluciones a su propia tabla (§10);
 - precio unitario MXN con imputación en cascada, solo para ABC (§9);
@@ -32,7 +33,8 @@ SALIDA = RAIZ / "data" / "processed"
 
 INICIO = pd.Timestamp("2015-01-01")
 FIN = pd.Timestamp("2026-09-01")        # último mes completo; oct-2026 es parcial (LOG #3)
-N_OBSOLETO = 12                         # meses sin venta para marcar obsoleto (§7)
+N_DORMIDO = 12                          # meses sin venta para marcar dormido (§7): se conserva como repuesto y
+                                        # puede volver a venderse; no se trata como descontinuado
 
 VENTA = "Venta Producto"
 DEVOLUCIONES = ["Devolución de producto", "Cargos por devolucion (vtas)", "Garantía de Producto",
@@ -44,13 +46,20 @@ def cargar():
     df = pd.read_parquet(ENTRADA)
     resumen = {"filas_crudas": len(df)}
 
+    # eje temporal = fechafactura; la línea sin factura toma su order_date (antes del deduplicado y del corte)
+    sin_factura = df.fechafactura.isna()
+    df["fechafactura"] = df.fechafactura.fillna(df.order_date)
+    resumen["fechafactura_desde_order_date"] = int(sin_factura.sum())
+    resumen["sin_fecha"] = int(df.fechafactura.isna().sum())
+    df = df[df.fechafactura.notna()]
+
     sin_origen = [c for c in df.columns if c not in ("source_file", "id_registro")]
     df = df.drop_duplicates(subset=sin_origen)
     resumen["tras_dup_completos"] = len(df)
     df = df.drop_duplicates(subset=CLAVE_DUP)
     resumen["tras_dup_clave"] = len(df)
 
-    df = df[df.order_date < FIN + pd.offsets.MonthBegin(1)]
+    df = df[df.fechafactura < FIN + pd.offsets.MonthBegin(1)]
     resumen["tras_corte_oct2026"] = len(df)
 
     # desfase orden → factura (§6: cuantificar)
@@ -79,8 +88,8 @@ def lineas(df, fam):
     df = df[df.concepto.isin([VENTA] + DEVOLUCIONES)].copy()
     df["cliente"] = anonimizar_clientes(df)
     df["familia"] = df.id_articulo.map(fam).fillna("SIN_FAMILIA")
-    df["mes"] = df.order_date.dt.to_period("M").dt.to_timestamp()
-    cols = ["order_date", "mes", "order_no", "id_articulo", "familia", "id_cliente", "cliente", "concepto",
+    df["mes"] = df.fechafactura.dt.to_period("M").dt.to_timestamp()
+    cols = ["fechafactura", "mes", "order_no", "id_articulo", "familia", "id_cliente", "cliente", "concepto",
             "cantidad", "subtotalmn", "precioventaunidadmn", "precioventaunidadusd", "exchange_rate2"]
     return df[cols]
 
@@ -127,12 +136,13 @@ def precio_sku_mes(v):
 
 
 def panel(v, fam):
-    """Rejilla SKU × mes (§7). Vida activa = [primer mes con venta, min(último mes con venta + N_OBSOLETO, FIN)].
-    Los ceros posteriores a la última venta (hasta N_OBSOLETO meses) son la evidencia de que el SKU se apagó;
-    más allá ya no se rellena para no inventar intermitencia (LOG_DECISIONES)."""
+    """Rejilla SKU × mes (§7). Vida activa = [primer mes con venta, min(último mes con venta + N_DORMIDO, FIN)].
+    Los ceros posteriores a la última venta (hasta N_DORMIDO meses) son la evidencia de que el SKU se durmió;
+    más allá ya no se rellena para no inventar intermitencia (LOG_DECISIONES). Un SKU dormido no es obsoleto: la
+    empresa conserva stock de repuesto y se espera que algunos vuelvan a venderse."""
     u = v.groupby(["id_articulo", "mes"]).cantidad.sum()
     vida = u.reset_index().groupby("id_articulo").mes.agg(primera_venta="min", ultima_venta="max")
-    vida["fin_vida"] = (vida.ultima_venta + pd.DateOffset(months=N_OBSOLETO)).clip(upper=FIN)
+    vida["fin_vida"] = (vida.ultima_venta + pd.DateOffset(months=N_DORMIDO)).clip(upper=FIN)
 
     meses = pd.date_range(INICIO, FIN, freq="MS")
     filas = [(sku, m) for sku, r in vida.iterrows() for m in meses[(meses >= r.primera_venta) & (meses <= r.fin_vida)]]
@@ -141,10 +151,10 @@ def panel(v, fam):
     p = p.merge(vida.reset_index(), on="id_articulo")
     p["familia"] = p.id_articulo.map(fam).fillna("SIN_FAMILIA")
     p["edad_meses"] = ((p.mes.dt.year - p.primera_venta.dt.year) * 12 + p.mes.dt.month - p.primera_venta.dt.month)
-    # obsoleto "hoy" (a FIN) solo para reporte; en el backtest se recalcula en cada origen (LOG #6)
-    p["obsoleto_a_fin"] = p.ultima_venta <= FIN - pd.DateOffset(months=N_OBSOLETO)
+    # dormido "hoy" (a FIN) solo para reporte; en el backtest se recalcula en cada origen (LOG #6)
+    p["dormido_a_fin"] = p.ultima_venta <= FIN - pd.DateOffset(months=N_DORMIDO)
     cols = ["id_articulo", "familia", "mes", "unidades", "primera_venta", "ultima_venta", "fin_vida", "edad_meses",
-            "obsoleto_a_fin"]
+            "dormido_a_fin"]
     return p[cols].sort_values(["id_articulo", "mes"]).reset_index(drop=True)
 
 
@@ -165,7 +175,7 @@ def main():
     resumen.update({
         "venta_lineas": len(ventas), "venta_unidades": float(ventas.cantidad.sum()),
         "devolucion_lineas": len(dev), "devolucion_unidades": float(dev.unidades_dev.sum()),
-        "skus": int(pan.id_articulo.nunique()), "skus_obsoletos_a_fin": int(pan.groupby("id_articulo").obsoleto_a_fin.first().sum()),
+        "skus": int(pan.id_articulo.nunique()), "skus_dormidos_a_fin": int(pan.groupby("id_articulo").dormido_a_fin.first().sum()),
         "familias": int(pan.familia.nunique()), "clientes": int(ventas.cliente.nunique()),
         "clientes_id_crudo": int(ventas.id_cliente.nunique()),
         "panel_filas": len(pan), "panel_pct_ceros": float((pan.unidades == 0).mean()),

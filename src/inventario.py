@@ -1,28 +1,30 @@
 """Recomendación de pedido y simulación de inventario (fase 4; DECISIONES.md §14, LOG_DECISIONES #25).
 
-Política order-up-to con revisión mensual (R = 1) y lead time L = 3:
-    al cierre del mes T se pide  Q_T = max(0, S_T − posición),  S_T = pronóstico de la ventana T+1…T+4 + SS_T
-    posición = on-hand tras la recepción del cierre de T + tránsito (pedidos de T−2 y T−1)
-    Q_T llega al cierre de T+3 y surte T+4.
-Pronóstico de la ventana = suma de los pronósticos h = 4 ya emitidos para cada mes (T+1 se pronosticó en T−3, …,
-T+4 en T). Todos usan datos ≤ T, así que no hay leakage. Si falta un mes (SKU que no estaba en el set en ese
-origen), se usa el pronóstico de T+4 como proxy plano.
+Política order-up-to con revisión mensual (R = 1); la ventana de protección R + L es el horizonte H = 3 (L = H − R = 2):
+    al cierre del mes T se pide  Q_T = max(0, S_T − posición),  S_T = pronóstico de la ventana T+1…T+H + SS_T
+    posición = on-hand tras la recepción del cierre de T + tránsito (pedidos de T−H+2 … T−1; con H = 3, el de T−1)
+    Q_T llega al cierre de T+H−1 y surte T+H.
+Pronóstico de la ventana = suma de los pronósticos h = H ya emitidos para cada mes (T+1 se pronosticó en T+1−H, …,
+T+H en T). Todos usan datos ≤ T, así que no hay leakage. Si falta un mes (SKU que no estaba en el set en ese
+origen), se usa el pronóstico de T+H como proxy plano.
 
 Pronóstico por SKU y mes: el modelo evaluado para SKUs maduros, `Media_post` para los jóvenes (LOG #24) y 0 para
-los que salieron del set (sin venta en 12 meses): la política deja de pedirles y su stock queda "en riesgo".
+los dormidos (sin venta en 12 meses): la política deja de pedirles y su stock se reporta como exposición. Se
+conservan como repuesto y pueden reactivarse; su venta de reactivación se reporta aparte (`cobertura.csv`).
 
 Stock de seguridad (SS), con errores observados ≤ T:
     sin_ss     SS = 0
-    normal     z_α · 2 · RMSE del SKU (errores mensuales de los últimos 12 meses; √4 meses de ventana, supuesto de
+    normal     z_α · √H · RMSE del SKU (errores mensuales de los últimos 12 meses; √H meses de ventana, supuesto de
                independencia). Con < 6 errores se usa el RMSE relativo de su clase × escala.
-    empirico   cuantil α del error de ventana relativo (Σ 4 meses de (real − pronóstico) / escala), agrupado por clase
+    empirico   cuantil α del error de ventana relativo (Σ H meses de (real − pronóstico) / escala), agrupado por clase
                SB (o "joven") × escala del SKU. No supone normalidad y absorbe el sesgo del modelo (§14: los
                intermitentes no usan la fórmula normal).
     Arranque (< MIN_POOL errores de ventana): SS = 1 mes de pronóstico.
 
 Supuestos (§14): ventas perdidas (lo no surtido no se recupera), sin órdenes abiertas al inicio, arranque ideal de
 cada SKU (on-hand = 1 mes + SS, tránsito = pronóstico). Por eso las métricas se miden después del calentamiento:
-validación ene–ago 2025 y prueba sep-2025 → sep-2026.
+validación ene–jun 2025 (demanda ≤ primer origen de prueba, para que la política no se elija con datos posteriores)
+y prueba sep-2025 → sep-2026. Jul–ago 2025 usan los pronósticos del periodo puente del backtest (solo continuidad).
 
 Uso:  venv\\Scripts\\python.exe src\\inventario.py          (escribe data/processed/resultados/inv_*.csv)
 """
@@ -36,30 +38,39 @@ from scipy.stats import norm
 import features as ft
 from backtest import SALIDA
 from features import H, MESES, PROC
+from jerarquico import modelo_elegido
 
 NIVELES = [.80, .90, .95, .98]
 NIVEL_ABC = {"A": .95, "B": .90, "C": .80, "sin_ABC": .90}   # sin_ABC = SKUs nuevos después de ago-2025
-MODELOS = ["TD_mix_k3", "ML_base", "Ruta_clasica", "MA12", "SNaive"]   # TD_mix_k3 = modelo elegido (LOG #32)
+MODELOS = [modelo_elegido(), "ML_base", "Ruta_clasica", "MA12", "SNaive"]   # TD_estado_LGBM_tw = modelo elegido (LOG #50)
 METODOS = ["sin_ss", "normal", "empirico"]
 MIN_POOL = 200
 MIN_ERR_SKU = 6
 I = MESES.get_loc
 M0, M1 = I(pd.Timestamp("2024-09-01")), I(pd.Timestamp("2026-09-01"))      # meses objetivo con pronóstico
-PERIODOS = {"validacion": ("2025-01-01", "2025-08-01"), "prueba": ("2025-09-01", "2026-09-01")}
+PERIODOS = {"validacion": ("2025-01-01", "2025-06-01"), "prueba": ("2025-09-01", "2026-09-01")}
+FUENTES = ("validacion", "puente", "prueba")                                 # periodos del backtest que se leen
 
 
 class Insumos:
-    """Matrices SKU × mes (índice de MESES) de demanda real, pronóstico h = 4, escala y clase en el origen."""
+    """Matrices SKU × mes (índice de MESES) de demanda real, pronóstico h = H, escala y clase en el origen."""
 
-    def __init__(self, modelo, datos=None):
+    def __init__(self, modelo, datos=None, extra=None):
+        """`extra`: DataFrame (id_articulo, origen, modelo) con un pronóstico que no está en los parquet del backtest
+        (p. ej. `TD_estado_LGBM_tw`, `inventario_lgbm.py`); debe cubrir validación, puente y prueba."""
         datos = datos or ft.Datos.cargar()
-        mad = pd.concat([pd.read_parquet(SALIDA / f"pronosticos_{p}.parquet") for p in ("validacion", "prueba")])
-        if modelo.startswith("TD_"):                           # pronóstico jerárquico (src/jerarquico.py, LOG #32)
-            jer = pd.concat([pd.read_parquet(SALIDA / f"pronosticos_{p}_jer.parquet") for p in ("validacion", "prueba")])
+        mad = pd.concat([pd.read_parquet(SALIDA / f"pronosticos_{p}.parquet") for p in FUENTES])
+        if extra is None and modelo == "TD_estado_LGBM_tw":    # modelo adoptado (LOG #50), de `inventario_lgbm.py`
+            extra = pd.read_parquet(SALIDA / "td_lgbm_tw_inventario.parquet")
+        if extra is not None:
+            mad = mad.merge(extra[["id_articulo", "origen", modelo]], on=["id_articulo", "origen"], how="left")
+            assert mad[modelo].notna().all(), f"{modelo}: faltan pronósticos en `extra`"
+        elif modelo.startswith("TD_"):                         # pronóstico jerárquico (src/jerarquico.py, LOG #32)
+            jer = pd.concat([pd.read_parquet(SALIDA / f"pronosticos_{p}_jer.parquet") for p in FUENTES])
             mad = mad.merge(jer[["id_articulo", "origen", modelo]], on=["id_articulo", "origen"], how="left")
         esc = pd.read_parquet(PROC / "features.parquet", columns=["id_articulo", "origen", "escala"])
         mad = mad.merge(esc, on=["id_articulo", "origen"], how="left")
-        jov = pd.concat([pd.read_parquet(SALIDA / f"cold_jovenes_{p}.parquet") for p in ("validacion", "prueba")])
+        jov = pd.concat([pd.read_parquet(SALIDA / f"cold_jovenes_{p}.parquet") for p in FUENTES])
         filas = pd.concat([mad[["id_articulo", "mes_obj", modelo, "escala", "clase"]].rename(columns={modelo: "f"}),
                            jov[["id_articulo", "mes_obj", "Media_post", "escala"]].rename(columns={"Media_post": "f"})
                            .assign(clase="joven")], ignore_index=True)
@@ -70,7 +81,7 @@ class Insumos:
         self.F = np.zeros((n, T))
         self.esc = np.full((n, T), np.nan)
         self.clase = np.full((n, T), "", dtype=object)
-        self.tiene = np.zeros((n, T), bool)                 # hay pronóstico emitido en el origen m − 4
+        self.tiene = np.zeros((n, T), bool)                 # hay pronóstico emitido en el origen m − H
         self.F[r, c], self.esc[r, c], self.clase[r, c], self.tiene[r, c] = filas.f, filas.escala, filas.clase, True
         self.D = np.nan_to_num(datos.y[datos.skus.get_indexer(self.skus)])
         self.familia = datos.familia[datos.skus.get_indexer(self.skus)]
@@ -83,14 +94,14 @@ class Insumos:
 
 
 def _ventana(ins, T):
-    """Pronóstico de T+1…T+4 con lo emitido hasta T (proxy plano del de T+4 donde falta)."""
+    """Pronóstico de T+1…T+H con lo emitido hasta T (proxy plano del de T+H donde falta)."""
     m = np.arange(T + 1, T + H + 1)
     f = np.where(ins.tiene[:, m], ins.F[:, m], ins.F[:, [T + H]])
     return f.sum(axis=1), f
 
 
 def _errores_ventana(ins, T):
-    """Errores de ventana relativos ya observados en T: decisiones T' con T' + 4 ≤ T y los 4 meses pronosticados."""
+    """Errores de ventana relativos ya observados en T: decisiones T' con T' + H ≤ T y los H meses pronosticados."""
     filas = []
     for Tp in range(M0 - 1, T - H + 1):
         m = np.arange(Tp + 1, Tp + H + 1)
@@ -148,7 +159,7 @@ def _ss(ins, T, metodo, alfa, f_ventana):
     rmse_rel = rel.groupby("clase").r.apply(lambda s: np.sqrt((s ** 2).mean()))
     rmse_pool = pd.Series(clase).map(rmse_rel).fillna(np.sqrt((rel.r ** 2).mean())).to_numpy() * esc
     sigma = np.where(n_obs >= MIN_ERR_SKU, rmse, rmse_pool)
-    return np.where(vivo, norm.ppf(alfa) * 2 * np.nan_to_num(sigma), 0.0)
+    return np.where(vivo, norm.ppf(alfa) * np.sqrt(H) * np.nan_to_num(sigma), 0.0)
 
 
 def simular(ins, metodo, alfa):
@@ -174,9 +185,10 @@ def simular(ins, metodo, alfa):
         nuevo = (ins.inicio <= t) & ~activo
         if nuevo.any():                                  # arranque ideal del SKU
             oh[nuevo] = f[nuevo, 0] + ss[nuevo]
-            arr[nuevo, t + 2], arr[nuevo, t + 3] = f[nuevo, 1], f[nuevo, 2]
+            for j in range(2, H):                        # tránsito = pronóstico de T+2 … T+H−1
+                arr[nuevo, t + j] = f[nuevo, j - 1]
             activo |= nuevo
-        posicion = oh + arr[:, t + 2] + arr[:, t + 3]
+        posicion = oh + arr[:, t + 2:t + H].sum(axis=1)  # pedidos en tránsito (llegan para surtir T+2 … T+H−1)
         q = np.where(activo, np.maximum(fv + ss - posicion, 0), 0.0)
         arr[:, t + H] = q
         ped[:, t] = q
@@ -200,7 +212,8 @@ def metricas(ins, sim, desde, hasta, filtro=None):
 
 
 def stock_en_riesgo(ins, sim):
-    """Valor del stock al cierre de sep-2026 en SKUs sin venta real en los últimos 6 meses (obsolescencia)."""
+    """Valor del stock al cierre de sep-2026 en SKUs sin venta real en los últimos 6 meses. No es obsolescencia: parte
+    se conserva a propósito como repuesto (SKUs dormidos que pueden volver a venderse); se reporta como exposición."""
     dem, ven, inv, ped = sim
     final = inv[:, M1] - ven[:, M1] / 2
     sin_venta = ins.D[:, M1 - 5:M1 + 1].sum(axis=1) == 0

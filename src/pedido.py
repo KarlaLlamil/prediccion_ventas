@@ -1,9 +1,10 @@
 """Pedido recomendado al cierre del último mes con datos (sep-2026), con la política elegida en LOG #25.
 
-Ventana = oct-2026 … ene-2027 (R + L = 4). Cada mes se pronostica a h = 4 desde su origen (jun … sep-2026), igual que
-en la simulación. Para los SKUs maduros se usa `TD_mix` (LOG #32): `ML_base` reconciliado con el nivel × índice
-estacional de su familia (`jerarquico.py`). Para los jóvenes, `Media_post`. El SS es empírico, con todos los errores
-de ventana de `TD_mix` observados hasta sep-2026.
+Ventana = oct-2026 … dic-2026 (R + L = H = 3). Cada mes se pronostica a h = H desde su origen (jul … sep-2026), igual
+que en la simulación. Para los SKUs maduros se usa `TD_estado_LGBM_tw` (LOG #50, `jerarquico.py`): según el estado
+de la familia en el origen, `TD_mix_k3` en caída, `TD_mix_k12` en subida y el ML estable, con LightGBM Tweedie como
+ML (antes `ML_base`, LOG #45). Para los jóvenes, `Media_post`. El SS es empírico, con todos los errores de ventana
+del modelo elegido observados hasta sep-2026.
 
     S = ventana + SS                      nivel objetivo (order-up-to)
     Q = max(0, S − on-hand − tránsito)    tránsito desconocido (§14 [SUPUESTO]): Q es una cota superior
@@ -24,6 +25,7 @@ import features as ft
 import inventario as iv
 import jerarquico as jq
 from backtest import HIPER, ml
+from comparar_lgbm import HIPER as HIPER_LGBM, lgbm
 from features import BASE, H, MESES, PROC, RAIZ
 from metricas import clase_sb
 
@@ -36,22 +38,25 @@ def main():
     datos = ft.Datos.cargar()
     meta = (PROC / "resultados" / "meta.json")
     hiper = HIPER[json.loads(meta.read_text(encoding="utf-8"))["hiper_elegido"]]
-    k = json.loads((PROC / "resultados" / "meta_jer.json").read_text(encoding="utf-8"))["k_elegido"]
-    modelo = f"TD_mix_{k}"
+    modelo = jq.modelo_elegido()
     tabla = pd.read_parquet(PROC / "features.parquet")
     T = len(MESES) - 1                                           # sep-2026
-    origenes = range(T - H + 1, T + 1)                           # jun … sep-2026
+    origenes = range(T - H + 1, T + 1)                           # jul … sep-2026 (H = 3)
 
     mad = []
     for o in origenes:
         te = tabla[tabla.origen == MESES[o]]
         f = ml(tabla, BASE, o, hiper)
+        fl = lgbm(tabla, BASE, o, HIPER_LGBM[jq.REGRESOR])
         mad.append(pd.DataFrame({"id_articulo": te.id_articulo.to_numpy(), "familia": te.familia.to_numpy(),
                                  "origen": MESES[o], "mes_obj": te.mes_obj.to_numpy(), "ML_base": f.to_numpy(),
-                                 "escala": te.escala.to_numpy(),
+                                 jq.REGRESOR: fl.to_numpy(), "escala": te.escala.to_numpy(),
                                  "clase": clase_sb(te.adi.to_numpy(), te.cv2.to_numpy())}))
-    mad = jq.construir(datos, pd.concat(mad, ignore_index=True))
-    mad = [mad.rename(columns={modelo: "f"})[["id_articulo", "origen", "mes_obj", "f", "escala", "clase"]]]
+    mad = pd.concat(mad, ignore_index=True)
+    # modelo adoptado (LOG #50): la regla TD_estado con LightGBM Tweedie en el lugar de ML_base
+    regresor = jq.REGRESOR if modelo == jq.ADOPTADO else "ML_base"
+    mad = jq.construir(datos, mad.assign(ML_base=mad[regresor]))
+    mad = [mad.rename(columns={jq.ELEGIDO: "f"})[["id_articulo", "origen", "mes_obj", "f", "escala", "clase"]]]
     L, A = cs.lanzamientos(datos)
     jov, _ = cs.construir(datos, L, A, list(origenes))
     jov = jov[["id_articulo", "origen", "mes_obj", "Media_post", "escala"]].rename(columns={"Media_post": "f"})

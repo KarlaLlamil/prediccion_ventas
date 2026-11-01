@@ -17,10 +17,17 @@ md("""
 Fase 1 de DECISIONES.md (§2, §12). Entrada: tablas de `data/processed/` generadas por `src/preparar.py`.
 
 **Recordatorios de la línea base**
-- Target: unidades de `Venta Producto` por `id_articulo` y mes (venta bruta, sell-in). Eje temporal = `order_date`.
-- Horizonte h = 4 → en el modelado solo lags ≥ 4. Aquí, en el EDA, se mira la historia completa.
+- Target: unidades de `Venta Producto` por `id_articulo` y mes (venta bruta, sell-in). Eje temporal = `fechafactura`.
+- Horizonte h = 3 → en el modelado solo lags ≥ 3. Aquí, en el EDA, se mira la historia completa.
 - Holdout de prueba: sep-2025 → sep-2026. Las **clasificaciones de SKU (ABC/XYZ/ADI)** de este notebook se calculan
   solo con datos **≤ ago-2025** para que puedan reutilizarse en el modelado sin leakage.
+- **Dormidos:** SKUs con ≥ 12 meses sin venta. No son obsoletos: la empresa conserva stock de repuesto para clientes
+  con equipos antiguos y se espera que algunos vuelvan a venderse. No se evalúa su pronóstico; se reporta su
+  comportamiento (reactivaciones).
+- **Proyecto/base:** no hay etiqueta en el catálogo; se usa la clase Syntetos–Boylan como proxy (grumosa/intermitente =
+  proyecto: venta intermitente y a veces muy grande; suave/errática = base: venta más constante).
+- Marcadores (solo de reporte, sin atribuir causa): `pico_2018_10`, `caida_2019`, `pico_2023_10`, `caida_2024` y los
+  meses bajos del total detectados con la regla causal de `features.meses_bajos` (como mínimo `caida_2020_04_05`).
 - Sin descripciones de producto ni nombres de cliente: solo claves (`id_articulo`, familia, `CLxxxx`).
 """)
 
@@ -39,6 +46,8 @@ from statsmodels.graphics.tsaplots import plot_acf
 RAIZ = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
 sys.path.insert(0, str(RAIZ / "src"))
 from estilo import aplicar, COLORES, AZUL, GRIS, GRIS_CLARO, AZULES, MESES, FMT_MILES
+import features as ft
+from features import H                       # horizonte del pronóstico (3 meses)
 
 aplicar()
 warnings.filterwarnings("ignore", message="Mean of empty slice")   # medianas móviles sobre ventanas vacías al inicio de cada SKU
@@ -59,9 +68,22 @@ resumen = json.loads((PROC / "resumen_preparacion.json").read_text(encoding="utf
 FIN_TRAIN = pd.Timestamp("2025-08-01")      # último mes antes del holdout
 INICIO_TEST = pd.Timestamp("2025-09-01")
 COVID = (pd.Timestamp("2020-03-01"), pd.Timestamp("2022-12-01"))   # régimen externo: limpiar/interpretar, no predictor (LOG #16)
-# Marcadores de reporte (no features): 2019 = pulso de destock, 2024 = escalón de destock (LOG #16)
-PULSO_2019 = (pd.Timestamp("2019-01-01"), pd.Timestamp("2019-12-31"))
-ESCALON_2024 = pd.Timestamp("2024-01-01")
+# Marcadores de reporte (no features, sin atribuir causa): nombre → (inicio, fin)
+ts = pd.Timestamp
+MARCAS = {"pico_2018_10": (ts("2018-10-01"), ts("2018-10-01")), "caida_2019": (ts("2019-01-01"), ts("2019-12-01")),
+          "pico_2023_10": (ts("2023-10-01"), ts("2023-10-01")), "caida_2024": (ts("2024-01-01"), ts("2024-12-01"))}
+# meses anormalmente bajos del total: misma regla causal que usa el modelado (features.meses_bajos)
+tot_mes = panel.groupby("mes").unidades.sum().reindex(ft.MESES, fill_value=0)
+BAJO, FACTOR_BAJO = ft.meses_bajos(tot_mes.to_numpy())
+MARCAS.update({n: (ms[0], ms[-1]) for n, ms in ft.nombres_bajos(BAJO).items()})
+print("Marcadores:", {n: f"{a:%Y-%m}" + (f"…{b:%Y-%m}" if b != a else "") for n, (a, b) in MARCAS.items()})
+
+def marcar(ax, texto=True):
+    for n, (a, b) in MARCAS.items():
+        col = COLORES[1] if n.startswith("caida") else COLORES[2]
+        ax.axvspan(a - pd.DateOffset(days=12), b + pd.DateOffset(days=12), color=col, alpha=.12, lw=0)
+        if texto:
+            ax.text(a, ax.get_ylim()[1], n, va="top", fontsize=7, color=GRIS, rotation=90)
 """)
 
 md("## 1. Calidad de datos y limpieza")
@@ -76,7 +98,7 @@ print(f"SKUs: {resumen['skus']:,}  ·  familias: {resumen['familias']}  ·  clie
 print("Origen del precio SKU-mes (§9):", resumen["precio_origen"])
 """)
 md("""
-**Lectura:** la fecha de orden y la de factura casi siempre coinciden, así que elegir `order_date` como eje (§6)
+**Lectura:** la fecha de orden y la de factura casi siempre coinciden, así que elegir `fechafactura` como eje (§6)
 no mueve unidades entre meses de forma material.
 """)
 
@@ -101,23 +123,23 @@ anual = ventas.groupby(ventas.mes.dt.year).cantidad.sum()
 
 fig, ax = plt.subplots(figsize=(11, 3.8))
 ax.axvspan(*COVID, color=GRIS_CLARO, alpha=.35, lw=0)
-ax.axvspan(*PULSO_2019, color=COLORES[1], alpha=.08, lw=0)
-ax.axvline(ESCALON_2024, color=COLORES[1], lw=1, ls=":")
 ax.axvspan(INICIO_TEST, mensual.index.max(), color=AZULES[0], alpha=.6, lw=0)
 ax.plot(mensual.index, mensual.values, color=AZUL)
 ax.plot(mensual.index, mensual.rolling(12, center=True).mean(), color=GRIS, lw=1.5, ls="--")
 ax.yaxis.set_major_formatter(FMT_MILES)
 ax.set_title("Unidades vendidas por mes (Venta Producto)")
-for x, t in [(COVID[0], "COVID 2020–22"), (PULSO_2019[0], "2019 pulso"), (ESCALON_2024, "2024 escalón"), (INICIO_TEST, "test")]:
-    ax.text(x, ax.get_ylim()[1], t, va="top", fontsize=8, color=GRIS)
+marcar(ax)
+for x, t in [(COVID[0], "COVID 2020–22"), (INICIO_TEST, "test")]:
+    ax.text(x, ax.get_ylim()[1] * .93, t, va="top", fontsize=8, color=GRIS)
 ax.set_ylabel("unidades")
 guardar(fig, "01_serie_total"); plt.show()
 
 print((anual / 1e3).round(0).to_frame("miles de unidades").assign(var_pct=(anual.pct_change() * 100).round(1)).T.to_string())
 """)
 md("""
-Línea punteada: media móvil centrada de 12 meses. Marcadores (solo de reporte): COVID 2020–2022 (gris), pulso de destock
-2019 (naranja), escalón de destock 2024 (línea punteada naranja), holdout (azul).
+Línea punteada: media móvil centrada de 12 meses. Marcadores (solo de reporte, sin atribuir causa): COVID 2020–2022
+(gris), caídas (naranja: `caida_2019`, `caida_2024` y los meses bajos detectados), picos (`pico_2018_10`,
+`pico_2023_10`) y holdout (azul).
 """)
 
 py("""
@@ -138,10 +160,10 @@ py("""
 fig, ax = plt.subplots(figsize=(9, 3.2))
 plot_acf(mensual, lags=36, ax=ax, color=AZUL, vlines_kwargs={"colors": AZUL}, alpha=.05)
 ax.set_title("Autocorrelación de la serie total (lags en meses)")
-for l in (4, 12, 24):
+for l in (H, 12, 24):
     ax.axvline(l, color=GRIS_CLARO, lw=.8, ls=":")
 guardar(fig, "03_acf_total"); plt.show()
-print("ACF lag 4/12/24:", [round(mensual.autocorr(l), 2) for l in (4, 12, 24)])
+print(f"ACF lag {H}/12/24:", [round(mensual.autocorr(l), 2) for l in (H, 12, 24)])
 """)
 
 md("### 2.1 Heatmap estacional (índice mes / media del año)")
@@ -217,60 +239,118 @@ guardar(fig, "06_ciclo_vida"); plt.show()
 
 vida_m = ((skus.ultima.dt.year - skus.primera.dt.year) * 12 + skus.ultima.dt.month - skus.primera.dt.month + 1)
 print(f"Vida (meses entre 1ª y última venta): mediana {vida_m.median():.0f}, p25 {vida_m.quantile(.25):.0f}, p75 {vida_m.quantile(.75):.0f}")
-print(f"SKUs obsoletos al cierre (sin venta en 12 meses a sep-2026): {resumen['skus_obsoletos_a_fin']:,} de {resumen['skus']:,}")
+print(f"SKUs dormidos al cierre (sin venta en 12 meses a sep-2026): {resumen['skus_dormidos_a_fin']:,} de {resumen['skus']:,}")
 """)
 
+md("""
+### 3.0 SKUs dormidos y reactivaciones
+
+Un SKU está **dormido** tras 12 meses seguidos sin venta. La empresa conserva su stock como repuesto, así que se
+espera que algunos vuelvan a venderse. Aquí se mide con toda la historia (solo reporte, no entra al modelado):
+cuántos SKUs se durmieron alguna vez, cuántos se reactivaron, cuánto tiempo estuvieron dormidos y cuánto vendieron
+al volver. El pronóstico de los dormidos no se evalúa (quedan fuera del set del backtest); su reactivación se reporta
+en `cobertura.csv` del backtest.
+""")
 py("""
-# Métricas por SKU con datos hasta FIN_TRAIN (ago-2025), dentro de la vida activa
+vm = ventas.groupby(["id_articulo", "mes"]).cantidad.sum().reset_index().sort_values(["id_articulo", "mes"])
+vm["meses_desde_prev"] = vm.groupby("id_articulo").mes.diff().dt.days.div(30.44).round()
+react = vm[vm.meses_desde_prev >= 13].copy()             # ≥ 12 meses en cero entre dos ventas → reactivación
+react["meses_dormido"] = react.meses_desde_prev - 1
+# unidades de los 12 meses desde la reactivación
+por_sku = {k: g.set_index("mes").cantidad for k, g in vm[vm.id_articulo.isin(react.id_articulo)].groupby("id_articulo")}
+react["u_12m_tras_reactivar"] = [por_sku[r.id_articulo].loc[r.mes:r.mes + pd.DateOffset(months=11)].sum()
+                                 for r in react.itertuples()]
+durmieron = set(react.id_articulo) | set(skus.index[skus.ultima <= ft.MESES[-1] - pd.DateOffset(months=12)])
+print(f"SKUs que se durmieron alguna vez: {len(durmieron):,} de {len(skus):,}")
+print(f"Reactivaciones (venta tras ≥ 12 meses sin venta): {len(react):,} eventos en {react.id_articulo.nunique():,} SKUs "
+      f"({react.id_articulo.nunique() / len(durmieron):.0%} de los que se durmieron)")
+print("Meses dormido antes de reactivar:", react.meses_dormido.describe(percentiles=[.5, .9])[["50%", "90%", "max"]].to_dict())
+print(f"Unidades vendidas en los 12 meses tras reactivar: {react.u_12m_tras_reactivar.sum():,.0f} "
+      f"({react.u_12m_tras_reactivar.sum() / ventas.cantidad.sum():.2%} del total); mediana por evento "
+      f"{react.u_12m_tras_reactivar.median():.0f} u.")
+print("Reactivaciones por año:", react.mes.dt.year.value_counts().sort_index().to_dict())
+""")
+
+md("""
+### 3.1 Clases Syntetos–Boylan (datos ≤ ago-2025)
+
+ADI y CV² se calculan **solo con los meses hasta la última venta dentro del entrenamiento**: los ceros posteriores a la
+última venta no son intermitencia, son el SKU dormido (o en camino a dormirse). La misma definición, causal, se usa
+en el modelado (`features.clase_sb_causal`). Las clases se reportan por separado para **activos** (venta en los
+últimos 12 meses de train, sep-2024 → ago-2025) y **dormidos** (sin venta en esos 12 meses).
+""")
+py("""
 tr = panel[panel.mes <= FIN_TRAIN]
 
 def metricas(g):
-    y = g.unidades.to_numpy()
+    g = g.sort_values("mes")
+    ult = g.mes[g.unidades > 0].max()
+    hasta = g[g.mes <= ult] if pd.notna(ult) else g      # sin los ceros posteriores a la última venta
+    y = hasta.unidades.to_numpy()
     nz = y[y > 0]
     n = len(y)
     adi = n / len(nz) if len(nz) else np.inf
     cv2 = (nz.std() / nz.mean()) ** 2 if len(nz) > 1 else np.nan
     cv = y.std() / y.mean() if y.mean() > 0 else np.nan
+    yt = g.unidades.to_numpy()                           # vida activa completa (para % de ceros)
     return pd.Series({"meses": n, "meses_con_venta": len(nz), "pct_ceros": 1 - len(nz) / n, "adi": adi,
-                      "cv2": cv2, "cv": cv, "unidades": y.sum()})
+                      "cv2": cv2, "cv": cv, "unidades": y.sum(), "ultima_venta_train": ult,
+                      "ceros_tras_ultima": len(yt) - n})
 
-met = tr.groupby("id_articulo")[["unidades"]].apply(metricas)
+met = tr.groupby("id_articulo")[["mes", "unidades"]].apply(metricas)
 met = met.join(skus)
+met["estado"] = np.where(met.ultima_venta_train > FIN_TRAIN - pd.DateOffset(months=12), "activo", "dormido")
 
 def sb(r):
     if r.meses_con_venta < 2: return "insuficiente"
     if r.adi < 1.32: return "suave" if r.cv2 < .49 else "errática"
     return "intermitente" if r.cv2 < .49 else "grumosa"
 met["clase_sb"] = met.apply(sb, axis=1)
-print(f"SKUs con historia ≤ ago-2025: {len(met):,}")
-print(met.clase_sb.value_counts().to_frame("skus").assign(pct=lambda d: (d.skus / d.skus.sum() * 100).round(1),
-      pct_unidades=met.groupby("clase_sb").unidades.sum() / met.unidades.sum() * 100).round(1).to_string())
+met["tipo"] = met.clase_sb.map({"grumosa": "proyecto (proxy)", "intermitente": "proyecto (proxy)",
+                                "suave": "base", "errática": "base"}).fillna("insuficiente")
+print(f"SKUs con historia ≤ ago-2025: {len(met):,} · activos {(met.estado == 'activo').sum():,} · "
+      f"dormidos {(met.estado == 'dormido').sum():,}")
+for e, d in met.groupby("estado"):
+    print(f"\\n{e.upper()}: {len(d):,} SKUs")
+    print(d.clase_sb.value_counts().to_frame("skus").assign(pct=lambda x: (x.skus / x.skus.sum() * 100).round(1),
+          pct_unidades=d.groupby("clase_sb").unidades.sum() / d.unidades.sum() * 100).round(1).to_string())
+    print("tipo:", d.tipo.value_counts().to_dict())
+print("\\nCeros posteriores a la última venta que ya no cuentan en el ADI: "
+      f"{met.ceros_tras_ultima.sum():,} SKU-mes (mediana por dormido {met[met.estado == 'dormido'].ceros_tras_ultima.median():.0f})")
 """)
 
 py("""
 vis = met[met.clase_sb != "insuficiente"]
-fig, ax = plt.subplots(figsize=(7, 5))
-for c, col in zip(["suave", "errática", "intermitente", "grumosa"], COLORES):
-    d = vis[vis.clase_sb == c]
-    ax.scatter(d.adi, d.cv2, s=10, color=col, alpha=.55, label=f"{c} ({len(d)})", lw=0)
-ax.axvline(1.32, color=GRIS, lw=1, ls="--"); ax.axhline(.49, color=GRIS, lw=1, ls="--")
-ax.set_xscale("log"); ax.set_yscale("symlog", linthresh=.1); ax.set_ylim(bottom=0)
-ax.set_xlabel("ADI (meses entre ventas)"); ax.set_ylabel("CV² del tamaño de la demanda")
-ax.set_title("Clasificación Syntetos–Boylan (datos ≤ ago-2025)"); ax.legend(fontsize=8)
+fig, axs = plt.subplots(1, 2, figsize=(12, 4.8), sharex=True, sharey=True)
+for ax, e in zip(axs, ["activo", "dormido"]):
+    for c, col in zip(["suave", "errática", "intermitente", "grumosa"], COLORES):
+        d = vis[(vis.clase_sb == c) & (vis.estado == e)]
+        ax.scatter(d.adi, d.cv2, s=10, color=col, alpha=.55, label=f"{c} ({len(d)})", lw=0)
+    ax.axvline(1.32, color=GRIS, lw=1, ls="--"); ax.axhline(.49, color=GRIS, lw=1, ls="--")
+    ax.set_xscale("log"); ax.set_yscale("symlog", linthresh=.1); ax.set_ylim(bottom=0)
+    ax.set_xlabel("ADI (meses entre ventas, hasta la última venta)"); ax.set_title(f"SKUs {e}s", fontsize=10)
+    ax.legend(fontsize=8)
+axs[0].set_ylabel("CV² del tamaño de la demanda")
+fig.suptitle("Clasificación Syntetos–Boylan (datos ≤ ago-2025)", fontsize=11)
 guardar(fig, "07_adi_cv2"); plt.show()
 
-fig, ax = plt.subplots(figsize=(7, 3.2))
-ax.hist(met.pct_ceros, bins=20, color=AZUL, edgecolor="#fcfcfb")
-ax.set_title("% de meses en cero por SKU (dentro de vida activa)"); ax.set_xlabel("% meses en cero")
+fig, axs = plt.subplots(1, 2, figsize=(12, 3.2), sharey=True)
+for ax, e in zip(axs, ["activo", "dormido"]):
+    ax.hist(met[met.estado == e].pct_ceros, bins=20, color=AZUL, edgecolor="#fcfcfb")
+    ax.set_title(f"% de meses en cero por SKU {e} (hasta la última venta)", fontsize=10); ax.set_xlabel("% meses en cero")
 guardar(fig, "08_pct_ceros"); plt.show()
 """)
 
 md("""
-### 3.1 ABC × XYZ
+### 3.2 ABC × XYZ
 
 - **ABC** por valor de consumo (unidades × precio MXN) en los **últimos 12 meses de train** (sep-2024 → ago-2025),
   para SKUs vivos en ese periodo. A = 80 % acumulado del valor, B = siguiente 15 %, C = último 5 %.
-- **XYZ** por CV de la demanda mensual en los últimos 24 meses de train: X < 0.5, Y 0.5–1.0, Z > 1.0.
+- **XYZ** por CV de la demanda mensual en los últimos 24 meses de train: X < 0.5, Y 0.5–1.0, Z > 1.0. Dos versiones:
+  - `xyz` (principal): CV de la serie **dividida entre su mediana móvil centrada de 13 meses** (calculada solo con
+    datos ≤ ago-2025; si la mediana es 0, la media). Quita el nivel, así que el cambio de nivel de caida_2024 no infla
+    la variabilidad.
+  - `xyz_crudo`: CV de la serie tal cual (versión anterior).
 """)
 py("""
 ini12, ini24 = FIN_TRAIN - pd.DateOffset(months=11), FIN_TRAIN - pd.DateOffset(months=23)
@@ -280,15 +360,35 @@ valor = (v12.cantidad * v12.precio_mxn).groupby(v12.id_articulo).sum().sort_valu
 acum = valor.cumsum() / valor.sum()
 abc = pd.cut(acum, [0, .8, .95, 1.0001], labels=["A", "B", "C"]).rename("abc")
 
-p24 = panel[(panel.mes >= ini24) & (panel.mes <= FIN_TRAIN) & panel.id_articulo.isin(abc.index)]
-cv24 = p24.groupby("id_articulo").unidades.agg(lambda s: s.std() / s.mean() if s.mean() > 0 else np.nan)
-xyz = pd.cut(cv24, [-np.inf, .5, 1.0, np.inf], labels=["X", "Y", "Z"]).rename("xyz")
+def cv(s):
+    return s.std() / s.mean() if s.mean() > 0 else np.nan
 
-clas = pd.concat([abc, xyz, valor.rename("valor_mxn_12m")], axis=1).join(met[["clase_sb", "adi", "cv2", "pct_ceros", "familia"]])
-n = pd.crosstab(clas.abc, clas.xyz, margins=True, margins_name="total")
-val = pd.crosstab(clas.abc, clas.xyz, values=clas.valor_mxn_12m, aggfunc="sum", normalize=True).mul(100).round(1)
-print("SKUs por celda:"); print(n.to_string()); print()
-print("% del valor de consumo por celda:"); print(val.to_string()); print()
+def normalizada(s):
+    # serie / mediana móvil centrada de 13 meses, con datos ≤ FIN_TRAIN (tr ya está cortado)
+    s = s.set_index("mes").unidades
+    med = s.rolling(13, center=True, min_periods=7).median()
+    base = med.where(med > 0, s.rolling(13, center=True, min_periods=7).mean())
+    return (s / base).replace([np.inf, -np.inf], np.nan)
+
+p_tr = tr[tr.id_articulo.isin(abc.index)]
+norm_ = p_tr.groupby("id_articulo")[["mes", "unidades"]].apply(normalizada).rename("r").reset_index()
+norm_ = norm_[norm_.mes >= ini24]
+cv24_norm = norm_.groupby("id_articulo").r.agg(lambda s: s.std() / s.mean() if s.mean() > 0 else np.nan)
+p24 = p_tr[p_tr.mes >= ini24]
+cv24 = p24.groupby("id_articulo").unidades.agg(cv)
+cortes = [-np.inf, .5, 1.0, np.inf]
+xyz = pd.cut(cv24_norm, cortes, labels=["X", "Y", "Z"]).rename("xyz")
+xyz_crudo = pd.cut(cv24, cortes, labels=["X", "Y", "Z"]).rename("xyz_crudo")
+
+clas = pd.concat([abc, xyz, xyz_crudo, cv24_norm.rename("cv24_norm"), cv24.rename("cv24"), valor.rename("valor_mxn_12m")],
+                 axis=1).join(met[["clase_sb", "tipo", "estado", "adi", "cv2", "pct_ceros", "familia"]])
+for col in ["xyz", "xyz_crudo"]:
+    n = pd.crosstab(clas.abc, clas[col], margins=True, margins_name="total")
+    val = pd.crosstab(clas.abc, clas[col], values=clas.valor_mxn_12m, aggfunc="sum", normalize=True).mul(100).round(1)
+    print(f"[{col}] SKUs por celda:"); print(n.to_string()); print()
+    print(f"[{col}] % del valor de consumo por celda:"); print(val.to_string()); print()
+print("Migración XYZ crudo (filas) → normalizado (columnas):")
+print(pd.crosstab(clas.xyz_crudo, clas.xyz, margins=True, margins_name="total").to_string()); print()
 print("Clase Syntetos–Boylan dentro de cada ABC (n SKUs):")
 print(pd.crosstab(clas.abc, clas.clase_sb).to_string())
 clas.reset_index().to_parquet(PROC / "clasificacion_sku.parquet", index=False)
@@ -297,9 +397,12 @@ clas.reset_index().to_parquet(PROC / "clasificacion_sku.parquet", index=False)
 md("""
 ## 4. Anomalías y regímenes
 
-Marco (LOG #16): 2019 = **pulso** de destock, 2024 = **escalón** de destock; 2025 no es una contracción aparte.
-COVID 2020–2022 es régimen externo (sirve para limpiar e interpretar, no como predictor). Ninguno de estos marcadores
-entra al modelo como flag. La parte predictiva va por el **proxy de sobre-stock** (§4.6).
+Marcadores genéricos, sin atribuir causa: `pico_2018_10`, `caida_2019`, `pico_2023_10`, `caida_2024` y los meses
+bajos detectados en el total (`caida_2020_04_05`). La hipótesis de que las caídas de 2019 y 2024 fueran un ajuste
+tras una sobre-compra del año previo **se descartó**, así que aquí solo se describe quién y qué explica cada pico o
+caída. COVID 2020–2022 es régimen externo (sirve para limpiar e interpretar, no como predictor). Ninguno de estos
+marcadores entra al modelo como feature; los meses bajos del total sí se excluyen como objetivo de entrenamiento y se
+suben al piso en la serie limpia (§4.5).
 """)
 py("""
 ym = mensual.to_frame("u").assign(a=mensual.index.year, m=mensual.index.month)
@@ -317,59 +420,52 @@ print(); print(por_a.round(0).astype(int).to_string())
 """)
 
 md("""
-### 4.1 Oct-2018: ¿atípico o compra anticipada?
+### 4.1 Picos: pico_2018_10 y pico_2023_10
 
-Exceso de oct-2018 = unidades de oct-2018 − mediana de los octubres vecinos (2016, 2017, 2019), desglosado por
-cliente, familia y SKU. Después se revisa si quienes generaron el exceso compraron menos en los 12 meses siguientes
-(destock de 2019). **No se borra el dato:** se trata como señal.
+Diferencia del mes pico contra la mediana del mismo mes en los años vecinos, desglosada por cliente, familia y SKU.
+Solo describe quién explica el pico; **no se infiere que el pico cause la caída siguiente**. No se borra el dato.
 """)
 py('''
-def exceso(mes, refs, por):
+def sobre_vecinos(mes, refs, por):
     """Unidades del mes − mediana del mismo mes en los años de referencia, por la dimensión `por`."""
     t = ventas.groupby([por, "mes"]).cantidad.sum().unstack(fill_value=0)
     meses_ref = [pd.Timestamp(f"{a}-{mes.month:02d}-01") for a in refs]
     return (t[mes] - t[meses_ref].median(axis=1)).sort_values(ascending=False)
 
-M18 = pd.Timestamp("2018-10-01")
-exc_total = mensual[M18] - np.median([mensual[pd.Timestamp(f"{a}-10-01")] for a in (2016, 2017, 2019)])
-print(f"Oct-2018: {mensual[M18]:,.0f} u.  Exceso vs octubres vecinos: {exc_total:,.0f} u.")
-for por in ["cliente", "familia", "id_articulo"]:
-    e = exceso(M18, (2016, 2017, 2019), por)
-    print(f"  top-3 {por}: {e.head(3).round(0).astype(int).to_dict()}  → {e.head(3).sum() / exc_total:.0%} del exceso; "
-          f"top-10: {e.head(10).sum() / exc_total:.0%}")
+for nombre, refs in [("pico_2018_10", (2016, 2017, 2019)), ("pico_2023_10", (2021, 2022))]:
+    M = MARCAS[nombre][0]
+    dif = mensual[M] - np.median([mensual[pd.Timestamp(f"{a}-{M.month:02d}-01")] for a in refs])
+    print(f"{nombre}: {mensual[M]:,.0f} u.  Diferencia vs mismo mes de {refs}: {dif:+,.0f} u.")
+    for por in ["cliente", "familia", "id_articulo"]:
+        e = sobre_vecinos(M, refs, por)
+        print(f"  top-3 {por}: {e.head(3).round(0).astype(int).to_dict()}  → {e.head(3).sum() / dif:.0%} de la diferencia; "
+              f"top-10: {e.head(10).sum() / dif:.0%}")
 
-e_cli = exceso(M18, (2016, 2017, 2019), "cliente")
-top_cli = e_cli.head(3).index
+M18 = MARCAS["pico_2018_10"][0]
+top_cli = sobre_vecinos(M18, (2016, 2017, 2019), "cliente").head(3).index
 mc = ventas[ventas.cliente.isin(top_cli)].groupby(["mes", "cliente"]).cantidad.sum().unstack(fill_value=0)
-antes, despues = mc.loc["2017-10-01":"2018-09-01"].sum(), mc.loc["2018-11-01":"2019-10-01"].sum()
-print("\\nClientes del exceso: 12 m antes (oct17–sep18) vs oct-2018 vs 12 m después (nov18–oct19):")
-print(pd.DataFrame({"12m_antes": antes, "oct18": mc.loc[M18], "12m_despues": despues,
-                    "var_%": (despues / antes - 1) * 100}).round(0).astype(int).to_string())
-
-e_sku = exceso(M18, (2016, 2017, 2019), "id_articulo").head(20).index
-ms = ventas[ventas.id_articulo.isin(e_sku)].groupby("mes").cantidad.sum()
-print(f"\\nTop-20 SKUs del exceso: 12 m antes {ms.loc['2017-10-01':'2018-09-01'].sum():,.0f} · oct-18 {ms.get(M18, 0):,.0f} · "
-      f"12 m después {ms.loc['2018-11-01':'2019-10-01'].sum():,.0f}")
-
 fig, ax = plt.subplots(figsize=(11, 3.6))
 z = mc.loc["2017-01-01":"2020-06-01"]
 for c, col in zip(top_cli, COLORES):
     ax.plot(z.index, z[c], color=col, label=c)
 ax.axvline(M18, color=GRIS, lw=1, ls=":"); ax.yaxis.set_major_formatter(FMT_MILES); ax.legend(fontsize=8)
-ax.set_title("Clientes que generan el exceso de oct-2018: unidades por mes")
+ax.set_title("pico_2018_10: unidades por mes de los 3 clientes que más lo explican")
 guardar(fig, "12_oct2018_clientes"); plt.show()
 ''')
 
-md("### 4.2 Escalón 2024: ¿sobre-compra previa en 2023?")
+md("### 4.2 Caídas: caida_2019 y caida_2024")
 py('''
 nivel = mensual.groupby(mensual.index.year).mean()
+print("Promedio mensual 2017–2018: {:,.0f}  ·  2019: {:,.0f}  ({:+.1%})".format(
+    nivel.loc[2017:2018].mean(), nivel.loc[2019], nivel.loc[2019] / nivel.loc[2017:2018].mean() - 1))
 print("Promedio mensual 2021–2023: {:,.0f}  ·  2024–2025: {:,.0f}  ({:+.1%})".format(
     nivel.loc[2021:2023].mean(), nivel.loc[2024:2025].mean(), nivel.loc[2024:2025].mean() / nivel.loc[2021:2023].mean() - 1))
-M23 = pd.Timestamp("2023-10-01")
-exc23 = mensual[M23] - np.median([mensual[pd.Timestamp(f"{a}-10-01")] for a in (2021, 2022)])
-e23 = exceso(M23, (2021, 2022), "cliente")
-print(f"Oct-2023: {mensual[M23]:,.0f} u., exceso vs oct-2021/22: {exc23:,.0f} u.; top-3 clientes: {e23.head(3).round(0).astype(int).to_dict()}")
-print("(El detalle por cliente de la caída de 2024 está en §5.)")
+pf = ventas.groupby([ventas.mes.dt.year.rename("a"), "familia"]).cantidad.sum().unstack(0).fillna(0)
+for a in (2019, 2024):
+    d = (pf[a] - pf[a - 1]).sort_values()
+    print(f"\\n{a}: familias que más caen vs {a - 1} (unidades):", d.head(5).round(0).astype(int).to_dict(),
+          f"→ {d.head(5).sum() / d[d < 0].sum():.0%} de la caída bruta")
+print("(El detalle por cliente está en §5.)")
 ''')
 
 md("""
@@ -474,11 +570,19 @@ print(f"Índice robusto guardado para {ie.familia.nunique()} familias (≥ 36 me
 ''')
 
 md("""
-### 4.5 Outliers por SKU
+### 4.5 Outliers por SKU y meses bajos del total
 
-Para cada SKU, en log(1 + unidades): residuo frente a la mediana móvil centrada de 13 meses, escalado por la MAD
-del SKU (con piso de 0.25 para series con muchos ceros). Outlier = z > 3.5 con venta > 0. **Se marca, no se borra.**
-La ventana centrada sirve para limpiar/interpretar la historia; en el backtest se recalcula solo con train.
+**Picos por SKU.** En log(1 + unidades): residuo frente a la mediana móvil centrada de 13 meses, escalado por la MAD
+del SKU (piso 0.25). Outlier = z > 3.5 con venta > 0. **Se marca, no se borra.** La ventana centrada sirve para
+interpretar la historia; el modelado usa la versión causal (`features.limpiar_outliers`, solo meses previos).
+
+**Regla nueva:** la limpieza solo se aplica a los SKUs **suaves y erráticos** (clase al origen). En grumosos e
+intermitentes (proxy de proyecto) los picos *son* la demanda: la regla marcaba casi toda venta grande. Abajo se
+compara la regla anterior (todos los SKUs) con la nueva.
+
+**Meses bajos del total** (la regla de picos solo marca altos): log1p(total) < mediana de los 12 meses previos −
+3.5 · IQR/1.349 de los 24 previos (piso de escala 0.1), causal. En esos meses la serie limpia de los SKUs
+suaves/erráticos se sube al piso del total y el mes no se usa como objetivo de entrenamiento.
 """)
 py('''
 p = panel[["id_articulo", "familia", "mes", "unidades"]].copy()
@@ -487,76 +591,35 @@ p["base"] = p.groupby("id_articulo").l.transform(lambda s: s.rolling(13, center=
 p["res"] = p.l - p.base
 esc = p.groupby("id_articulo").res.transform(lambda r: max(1.4826 * (r - r.median()).abs().median(), .25))
 p["z"] = p.res / esc
-p["outlier"] = (p.z > 3.5) & (p.unidades > 0)
-p[["id_articulo", "mes", "unidades", "z", "outlier"]].to_parquet(PROC / "outliers_sku.parquet", index=False)
+p["clase_sb"] = p.id_articulo.map(met.clase_sb).fillna("sin_train")
+p["marcado_todos"] = (p.z > 3.5) & (p.unidades > 0)                    # regla anterior (v1)
+p["outlier"] = p.marcado_todos & p.clase_sb.isin(ft.CLASES_LIMPIAS)     # regla nueva: solo suaves y erráticos
+p[["id_articulo", "mes", "unidades", "z", "clase_sb", "marcado_todos", "outlier"]].to_parquet(PROC / "outliers_sku.parquet", index=False)
 
+v1 = p[p.marcado_todos]
+print("Regla anterior (todos los SKUs), SKU-mes marcados por clase SB:")
+print(v1.groupby("clase_sb").agg(sku_mes=("unidades", "size"), mediana_u=("unidades", "median"),
+                                 unidades=("unidades", "sum")).assign(pct=lambda d: (d.sku_mes / d.sku_mes.sum() * 100).round(1)).to_string())
 o = p[p.outlier]
-print(f"SKU-mes marcados: {len(o):,} de {(p.unidades > 0).sum():,} con venta ({len(o) / (p.unidades > 0).sum():.1%}); "
-      f"{o.unidades.sum() / p.unidades.sum():.1%} de las unidades; {o.id_articulo.nunique():,} SKUs")
+con_venta = (p.unidades > 0) & p.clase_sb.isin(ft.CLASES_LIMPIAS)
+print(f"\\nRegla nueva (suaves y erráticos): {len(o):,} SKU-mes de {con_venta.sum():,} con venta ({len(o) / con_venta.sum():.1%}); "
+      f"{o.unidades.sum() / p.unidades.sum():.1%} de las unidades; {o.id_articulo.nunique():,} SKUs "
+      f"(antes {len(v1):,} SKU-mes, {v1.unidades.sum() / p.unidades.sum():.1%} de las unidades)")
 um = o.groupby("mes").unidades.sum().reindex(mensual.index, fill_value=0) / mensual
+um1 = v1.groupby("mes").unidades.sum().reindex(mensual.index, fill_value=0) / mensual
 print("Meses con más unidades en outliers (% del mes):", (um.sort_values(ascending=False).head(6) * 100).round(1).to_dict())
 
 fig, ax = plt.subplots(figsize=(11, 3.2))
-ax.plot(um.index, um.values * 100, color=AZUL, lw=1.5)
-ax.axvspan(*COVID, color=GRIS_CLARO, alpha=.35, lw=0)
+ax.plot(um1.index, um1.values * 100, color=GRIS, lw=1.2, ls="--", label="regla anterior (todos)")
+ax.plot(um.index, um.values * 100, color=AZUL, lw=1.5, label="regla nueva (suaves y erráticos)")
+ax.axvspan(*COVID, color=GRIS_CLARO, alpha=.35, lw=0); ax.legend(fontsize=8)
 ax.set_ylabel("% de unidades del mes"); ax.set_title("Peso de los SKU-mes outlier en cada mes")
 guardar(fig, "16_outliers_mes"); plt.show()
-''')
 
-md("""
-### 4.6 Proxy de sobre-stock (sobre-disparo)
-
-Idea: un cliente que compra por encima de su ritmo "normal" acumula inventario y después compra menos (destock).
-- **Base local adaptativa** b_t = mediana de los 12 meses previos (t−12 … t−1); si es 0, la media (SKUs intermitentes).
-- **Exceso acumulado** E_t = Σ_{k=0..5}(y_{t−k} − b_{t−k}) / b_t, en "meses de demanda base" comprados de más.
-- **Chequeo predictivo sin leakage:** origen T = último mes conocido, objetivo T+4 (h = 4). Se compara E_T con
-  log(y_{T+4} / b_T). La simple reversión a la media daría ≈ 0; un destock real da **negativo** cuando E_T es alto.
-  La validación formal va en el backtest (fase 3).
-""")
-py('''
-def proxy(y):
-    b = y.shift(1).rolling(12, min_periods=6).median()
-    b = b.where(b > 0, y.shift(1).rolling(12, min_periods=6).mean())
-    E = (y - b).rolling(6, min_periods=6).sum() / b
-    objetivo = np.log1p(y.shift(-4)) - np.log1p(b)
-    return pd.DataFrame({"y": y, "b": b, "E": E, "objetivo": objetivo})
-
-ag = proxy(mensual)
-fig, ax = plt.subplots(figsize=(11, 3.4))
-ax.plot(ag.index, ag.E, color=AZUL)
-ax.axhline(0, color=GRIS, lw=.8); ax.axvspan(*PULSO_2019, color=COLORES[1], alpha=.08, lw=0)
-ax.axvline(ESCALON_2024, color=COLORES[1], lw=1, ls=":"); ax.axvspan(*COVID, color=GRIS_CLARO, alpha=.35, lw=0)
-ax.set_ylabel("meses de demanda base"); ax.set_title("Exceso acumulado de 6 meses vs base local (total)")
-guardar(fig, "17_proxy_total"); plt.show()
-v = ag.dropna()
-v_tr = v[v.index <= FIN_TRAIN - pd.DateOffset(months=4)]
-print(f"Total: corr. Spearman E_T vs log(y_T+4 / b_T) = {v_tr.E.corr(v_tr.objetivo, method='spearman'):.2f} (n = {len(v_tr)}, train)")
-
-# SKU y familia (agregado). Solo train y bases con volumen mínimo para evitar ruido de cola.
-def panel_proxy(df, clave, b_min):
-    out = []
-    for k, g in df.groupby(clave):
-        s = g.set_index("mes").unidades.asfreq("MS", fill_value=0)
-        r = proxy(s).assign(**{clave: k})
-        out.append(r)
-    r = pd.concat(out).dropna()
-    return r[(r.index <= FIN_TRAIN - pd.DateOffset(months=4)) & (r.b >= b_min)]
-
-ps = panel_proxy(panel, "id_articulo", 5)
-pf = panel_proxy(fam_m.stack().rename("unidades").reset_index(), "familia", 50)
-for nombre, d in [("SKU", ps), ("familia", pf)]:
-    q = pd.qcut(d.E.rank(method="first"), 5, labels=["Q1 bajo", "Q2", "Q3", "Q4", "Q5 alto"])
-    print(f"{nombre}: corr. Spearman = {d.E.corr(d.objetivo, method='spearman'):.2f} (n = {len(d):,}); "
-          f"mediana del objetivo por quintil de E: {d.groupby(q, observed=True).objetivo.median().round(2).to_dict()}")
-
-q = pd.qcut(ps.E.rank(method="first"), 5, labels=["Q1 bajo", "Q2", "Q3", "Q4", "Q5 alto"])
-m = ps.groupby(q, observed=True).objetivo.median()
-fig, ax = plt.subplots(figsize=(7, 3.2))
-ax.bar(m.index.astype(str), m.values, color=AZUL, width=.6)
-ax.axhline(0, color=GRIS, lw=.8)
-ax.set_ylabel("mediana log(y_T+4 / b_T)"); ax.set_xlabel("quintil del exceso acumulado E_T (SKU)")
-ax.set_title("Demanda a h = 4 vs base, según el sobre-disparo previo (SKU, train)")
-guardar(fig, "18_proxy_sku_quintiles"); plt.show()
+bajos = pd.DataFrame({"total": tot_mes, "bajo": BAJO, "factor_al_piso": FACTOR_BAJO}, index=ft.MESES)
+print("\\nMeses bajos del total detectados (regla causal):")
+print(bajos[bajos.bajo].assign(total=lambda d: d.total.round(0).astype(int), factor_al_piso=lambda d: d.factor_al_piso.round(2)).to_string())
+print("Nombres:", list(ft.nombres_bajos(BAJO)))
 ''')
 
 md("## 5. Puente de unidades por cliente (año contra año)")
@@ -590,7 +653,7 @@ guardar(fig, "09_puente_clientes"); plt.show()
 """)
 
 py("""
-# 2019 (pulso), 2024 (escalón) y 2025: ¿qué clientes explican la caída?
+# caida_2019, caida_2024 y 2025: ¿qué clientes explican cada caída? (descriptivo, sin atribuir causa)
 for a in (2019, 2024, 2025):
     d = (cy[a] - cy[a - 1]).sort_values()
     caida = d[d < 0]
@@ -636,11 +699,11 @@ tc = (c / ventas.groupby("cliente").cantidad.sum()).dropna()
 print("Tasa de devolución de los 5 clientes que más devuelven:", (tc.loc[c.head(5).index] * 100).round(1).to_dict())
 
 # desfase venta → devolución: última venta del mismo SKU al mismo cliente antes de la devolución
-s = ventas[["order_date", "cliente", "id_articulo"]].sort_values("order_date")
-r = real[["order_date", "cliente", "id_articulo"]].sort_values("order_date")
-emp = pd.merge_asof(r, s.rename(columns={"order_date": "fecha_venta"}), left_on="order_date", right_on="fecha_venta",
+s = ventas[["fechafactura", "cliente", "id_articulo"]].sort_values("fechafactura")
+r = real[["fechafactura", "cliente", "id_articulo"]].sort_values("fechafactura")
+emp = pd.merge_asof(r, s.rename(columns={"fechafactura": "fecha_venta"}), left_on="fechafactura", right_on="fecha_venta",
                     by=["cliente", "id_articulo"], direction="backward")
-lag = (emp.order_date - emp.fecha_venta).dt.days / 30.44
+lag = (emp.fechafactura - emp.fecha_venta).dt.days / 30.44
 print(f"Devoluciones con venta previa del mismo SKU-cliente: {lag.notna().mean():.1%}")
 print("Desfase (meses) venta→devolución:", lag.describe(percentiles=[.25, .5, .75, .9]).round(1)[["25%", "50%", "75%", "90%"]].to_dict())
 
@@ -655,28 +718,33 @@ md("## 7. Hallazgos")
 md("""
 **Datos y limpieza**
 - 1.40 M filas → 1.31 M líneas de Venta Producto (18.2 M unidades, ene-2015 → sep-2026). Se quitaron 1,209 duplicados
-  y oct-2026 (parcial). Orden y factura difieren solo en 0.16 % de las líneas → el eje `order_date` es seguro.
+  y oct-2026 (parcial). Orden y factura difieren solo en 0.16 % de las líneas → el eje `fechafactura` es seguro.
 - Precio MXN disponible en > 99.9 % de los SKU-mes; la cascada de §9 casi no se usa.
 
 **Nivel y tendencia**
-- Sin crecimiento estructural: 1.4–1.8 M unidades/año. Marcadores de reporte (LOG #16): **2019 = pulso** de destock
-  (−18.5 %) y **2024 = escalón** de destock (−15.9 %; el promedio mensual pasa de 139 k en 2021–23 a 118 k en 2024–25).
-  2025 (−2.2 %) es el mismo nivel bajo, no una contracción aparte.
-- COVID 2020–2022 (régimen externo): abr–may 2020 caen −49 % / −58 % y 2021 rebota (+20 %).
+- Sin crecimiento estructural: 1.4–1.8 M unidades/año. Marcadores de reporte, sin atribuir causa: **caida_2019**
+  (−18.5 %) y **caida_2024** (−15.9 %; el promedio mensual pasa de 139 k en 2021–23 a 118 k en 2024–25).
+  2025 (−2.2 %) es el mismo nivel bajo, no una contracción aparte. La hipótesis de que estas caídas se deban a una
+  sobre-compra del año previo **se descartó**.
+- COVID 2020–2022 (régimen externo): abr–may 2020 caen −49 % / −58 % y 2021 rebota (+20 %). La regla causal de meses
+  bajos del total marca exactamente **caida_2020_04_05** (z = 3.5): en la serie limpia esos meses se suben al piso
+  (× 1.44 / × 1.43) y no se usan como objetivo de entrenamiento.
 
 **Anomalías (§4.1–4.5)**
-- **Oct-2018 (278 k u.) es compra anticipada, no ruido.** El exceso frente a los octubres vecinos es de 120 k u.:
-  CL0001 + CL0004 + CL0008 generan el 78 %, la familia A05 el 56 % y un solo SKU (1597) el 53 %. Esos clientes
-  compraron 17 % / 4 % / 15 % menos en los 12 meses siguientes. Es el arranque del pulso de 2019 (CL0001 −189 k y
-  CL0004 −105 k en 2019). Se conserva como señal y se marca como outlier para que no infle los índices.
-- **2024 repite el patrón:** oct-2023 (203 k u.) trae un exceso de 48 k, liderado por CL0003, que en 2024 es el
-  cliente que más cae (−112 k). Además, CL0004 cae −63 k y CL0017 se pierde (−49 k).
+- **pico_2018_10 (278 k u.):** +120 k u. frente a los octubres vecinos. CL0001 + CL0004 + CL0008 explican el 78 %, la
+  familia A05 el 56 % y un solo SKU (1597) el 53 %. Se conserva el dato (no se borra).
+- **pico_2023_10 (203 k u.):** +48 k frente a oct-2021/22, con CL0003, CL0005 y CL0002 al frente (87 %).
+- **caida_2019 y caida_2024:** en 2019 caen sobre todo A05, B02 y C99 (y los clientes CL0001 −189 k y CL0004 −105 k);
+  en 2024, B02, A05 y C01 (CL0003 −112 k, CL0004 −63 k, CL0017 se pierde, −49 k). Es concentración en pocos
+  mayoristas, no un patrón que se pueda anticipar con la historia.
 - **Estacionalidad robusta:** con medianas y sin COVID, el índice de octubre baja de 1.37 (clásico) a **1.22** y el de
-  diciembre de 0.97 a 0.89. El índice clásico está inflado por oct-2018. Se guardan índices robustos para 44 familias
-  (`indice_estacional_familia.parquet`).
-- **Outliers por SKU:** 6.0 % de los SKU-mes con venta (5.7 % de las unidades). Los meses donde más pesan son
-  oct-2018 (36 % del mes), nov-2022 (32 %), dic-2018, ago-2023 y nov-2023: coinciden con los excesos previos a
-  cada destock. Se guardan en `outliers_sku.parquet` (marcados, no borrados).
+  diciembre de 0.97 a 0.89. El índice clásico está inflado por pico_2018_10. Se guardan índices robustos para 44
+  familias (`indice_estacional_familia.parquet`).
+- **Outliers por SKU:** con la regla anterior (todos los SKUs) se marcaban 5,866 SKU-mes y el **68 % eran de SKUs
+  grumosos o intermitentes**, con tamaños medianos de 10 y 3 unidades: la regla marcaba casi toda venta de proyecto.
+  Con la regla nueva (solo suaves y erráticos) quedan **1,721 SKU-mes** (2.3 % de sus meses con venta, 4.8 % de las
+  unidades totales). Los meses donde más pesan siguen siendo pico_2018_10 (33 % del mes), nov-2022, ago-2023,
+  dic-2018 y nov-2023. Se guardan en `outliers_sku.parquet` (marcados, no borrados, con la marca de ambas reglas).
 
 **COVID por familia (§4.3), 2020–2022 vs 2019**
 - Suben: A08 (+181 %), A06 (+67 %), E01, C12, A05, C02, C03 (+28–45 %). E01, C12 y C02 regresan a su nivel o quedan
@@ -686,37 +754,36 @@ md("""
 - **Por perfil** (`data/perfil_familia.csv`): de las 23 familias relevantes, las 9 *home_office* suben y 8 de 9
   *enterprise* bajan (la excepción es B05, +7 %). Índice 2019 = 100:
   - *enterprise* (46 % de las unidades de 2019): 80 en 2020, se recupera a 96–104 en 2021–23 y cae a 79–83 en
-    2024–25. El escalón de 2024 es sobre todo enterprise.
+    2024–25. caida_2024 es sobre todo enterprise.
   - *home_office* (25 %): 104 → 151 → 155 → 163, y sigue en ~146 en 2024–25. **El salto de COVID no se revirtió**,
     es un cambio de nivel estructural. (Su 145 de 2018 es el pico de oct-2018, SKU 1597.)
   - *mixto* (29 %): tendencia descendente de largo plazo (149 en 2015 → 79 en 2025), sin efecto COVID claro.
   → Para limpiar 2020–2022 no basta un ajuste uniforme: la dirección depende del perfil.
-
-**Proxy de sobre-stock (§4.6), chequeo preliminar en train**
-- **Total:** la correlación es negativa (Spearman −0.20). Tras un sobre-disparo, la demanda a h = 4 queda bajo la base.
-  El gráfico muestra picos de exceso antes de 2019 y antes de 2024. Es la firma del destock.
-- **SKU y familia:** la correlación es **positiva** (+0.21 / +0.22) porque domina el ciclo de vida. SKUs que suben
-  siguen subiendo y SKUs que se apagan siguen cayendo (Q1 de E → −0.62).
-  → La versión cruda no sirve tal cual a nivel SKU. Para la fase de features: medir el exceso contra una base con
-  tendencia (Holt/EWMA adaptativo), separar pulso corto (3 m) de tendencia y usar el proxy **agregado** como señal
-  común para los SKUs. Todas las variantes se validan en el backtest walk-forward.
 
 **Estacionalidad**
 - Moderada (fuerza STL 0.42). Patrón mediano: ago–oct fuerte (pico en **oct, índice 1.19**), abril y enero bajos
   (0.81 / 0.88). H2 = 54 % del año (rango 47–60 %). El mes pico cambia de un año a otro.
 - Los perfiles de las familias top se parecen al del total (correlación 0.62–0.90). Eso respalda usar un índice
   estacional de familia/total para SKUs con poca historia.
-- ACF del total: lag 4 ≈ 0 y lag 12 ≈ 0.30. Con h = 4 el lag-4 aporta poco por sí solo; pesan más el nivel
+- ACF del total: lag 3 ≈ 0.14 y lag 12 ≈ 0.30. Con h = 3 el lag-3 aporta poco por sí solo; pesan más el nivel
   (ventanas desfasadas) y el lag-12.
 
-**Intermitencia y segmentación (datos ≤ ago-2025)**
-- 2,339 SKUs. **Suaves: 7 % de los SKUs pero 63 % de las unidades**; erráticos 25 % / 32 %. Intermitentes y
-  grumosos son el 56 % de los SKUs pero solo el 5 % de las unidades.
+**Intermitencia y segmentación (datos ≤ ago-2025; ADI y CV² hasta la última venta)**
+- 2,339 SKUs con historia: **870 activos** (venta en sep-2024 → ago-2025) y **1,469 dormidos**. Quitar los ceros
+  posteriores a la última venta saca 19,327 SKU-mes del ADI (mediana de 12 por dormido).
+- **Activos:** suaves 18 % de los SKUs y **67 % de las unidades**; erráticos 57 % / 32 %. Grumosos e intermitentes
+  (proxy de proyecto) son el 23 % de los SKUs y < 1 % de las unidades.
   → El volumen se gana con ETS/SARIMA/modelo global sobre suaves y erráticos. Croston/SBA/TSB aplica a la cola larga.
-- ABC×XYZ: 208 SKUs A = 80 % del valor; **AX (71 SKUs) = 41 % del valor**. CZ = 330 SKUs con < 3 % del valor.
-- Vida mediana de un SKU: 43 meses. 1,532 de 2,417 SKUs están obsoletos a sep-2026. Hay unos 880–1,150 SKUs
-  vendiendo cada año. Hay rotación de catálogo alta, así que importan el arranque de SKUs nuevos y el decaimiento
-  (TSB).
+- **Dormidos:** la mitad son grumosos o intermitentes (proxy de proyecto, 50 %) y 18 % tienen historia insuficiente.
+  No se evalúa su pronóstico.
+- ABC×XYZ: 207 SKUs A = 80 % del valor. Con el **XYZ normalizado** (serie / mediana móvil de 13 meses) **AX = 77
+  SKUs, 42 % del valor** (crudo: 71 SKUs, 41 %); CZ = 310 SKUs (crudo: 330). De 825 SKUs con ambas versiones, 82 %
+  queda igual; 51 bajan de clase (26 Y → X y 25 Z → Y, el CV inflado por el cambio de nivel) y 31 suben (26 Y → Z,
+  5 X → Y).
+- Vida mediana de un SKU: 43 meses. 1,532 de 2,417 SKUs están **dormidos** a sep-2026. No son obsoletos: se
+  conserva stock de repuesto. **389 SKUs (24 % de los que se durmieron) se reactivaron** al menos una vez (503
+  eventos), tras una mediana de 20 meses dormidos (p90 42), pero con muy poco volumen: mediana de 2 u. por evento y
+  12.5 k u. en los 12 meses siguientes (0.07 % del total). Hay unos 880–1,150 SKUs vendiendo cada año.
 
 **Clientes (diagnóstico)**
 - Muy concentrado: en 2025 el top-5 = 76 % y el top-20 = 98 % de las unidades.
@@ -731,12 +798,12 @@ md("""
 - Concentradas: el top-5 de clientes = 70 % de las devoluciones (sin rotación). CL0022 devolvió el 92 % de lo que compró.
 - Desfase: en 99 % de los casos hay una venta previa del mismo SKU al mismo cliente. La mediana es de ~0.1 meses
   desde la venta más reciente y el p90 de 2.4 meses (medido contra la venta *más reciente*, así que es un límite
-  inferior). Las devoluciones caen cerca de la venta: una **tasa rezagada ≥ 4** como feature es viable para el
+  inferior). Las devoluciones caen cerca de la venta: una **tasa rezagada ≥ 3** como feature es viable para el
   experimento de baseline.
 - Estacionalidad de devoluciones: pico en enero (1.20), más bajas en abr / jul / dic.
 
-**Salida para la fase 2:** `data/processed/clasificacion_sku.parquet` (ABC, XYZ, clase Syntetos–Boylan, ADI, CV² por
-SKU, calculados solo con train).
+**Salida para la fase 2:** `data/processed/clasificacion_sku.parquet` (ABC, XYZ normalizado y crudo, clase
+Syntetos–Boylan, tipo proyecto/base, estado activo/dormido, ADI, CV² por SKU, calculados solo con train).
 """)
 
 nb = nbf.v4.new_notebook()
